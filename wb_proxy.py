@@ -14668,25 +14668,26 @@ def _anthropic_usage(usage):
     }
     if not isinstance(usage, dict):
         return out
-    try:
-        out["input_tokens"] = int(usage.get("prompt_tokens") or 0)
-    except (TypeError, ValueError):
-        pass
-    try:
-        out["output_tokens"] = int(usage.get("completion_tokens") or 0)
-    except (TypeError, ValueError):
-        pass
+
+    def _safe_int(val):
+        try:
+            return max(0, int(val or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    raw_prompt = _safe_int(usage.get("prompt_tokens"))
+    out["output_tokens"] = _safe_int(usage.get("completion_tokens"))
     cached = usage.get("prompt_cache_hit_tokens")
     if cached is None:
         cached = _best_cached_tokens(usage)
-    try:
-        out["cache_read_input_tokens"] = int(cached or 0)
-    except (TypeError, ValueError):
-        pass
-    try:
-        out["cache_creation_input_tokens"] = int(usage.get("prompt_cache_write_tokens") or 0)
-    except (TypeError, ValueError):
-        pass
+    out["cache_read_input_tokens"] = _safe_int(cached)
+    out["cache_creation_input_tokens"] = _safe_int(usage.get("prompt_cache_write_tokens"))
+
+    # Anthropic specification requires input_tokens to be uncached tokens only.
+    # Since OpenAI prompt_tokens includes cached tokens, subtract them:
+    cache_read = out["cache_read_input_tokens"]
+    cache_write = out["cache_creation_input_tokens"]
+    out["input_tokens"] = max(0, raw_prompt - cache_read - cache_write)
     service_tier = usage.get("service_tier")
     if service_tier:
         out["service_tier"] = service_tier

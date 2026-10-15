@@ -7465,7 +7465,7 @@ async function readImportFile(file){
     let rows;
     if(Array.isArray(doc)) rows = doc;
     else if(doc && Array.isArray(doc.accounts)) rows = doc.accounts;
-    else if(doc && (doc.accessToken || doc.auth)) rows = [doc];
+    else if(doc && (doc.accessToken || doc.auth || doc.access_token || doc.auth_raw)) rows = [doc];
     else throw new Error('文件里没有找到账号（既没有 accounts 数组，也不是单个账号）');
 
     if(!rows.length) throw new Error('账号列表是空的');
