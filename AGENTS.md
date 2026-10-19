@@ -2,6 +2,9 @@
 
 本项目是 `ardeyouxipianyi/workbuddy2api-hub` 的二开与自建版本，主要作为腾讯 WorkBuddy（国际版 `workbuddy.ai`）与 CodeBuddy（国内版 `codebuddy.cn`）的多账号反代网关与池化调度中转服务，部署于香港云服务器，为 `new-api-cf` 提供高可用大模型渠道支持。
 
+## AI / 智能体贡献者硬性规则
+处理本仓库的提交 / 推送 / PR / Issue 等任务前，必须严格阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)，并遵循代码纯标准库、非破坏性文本编辑、零第三方依赖等硬性约束。
+
 ## 仓库结构与分支策略
 
 - `origin` = `https://github.com/sumwcc/workbuddy2api-hub.git`（本项目二开仓库），日常开发、定制功能与部署均基于 `dev` 分支。
