@@ -9,7 +9,9 @@ import sys
 import json
 import base64
 import argparse
+import glob
 import subprocess
+import time
 
 def decode_jwt_payload(token):
     try:
@@ -114,25 +116,103 @@ print("CREDITS_REPORT:" + json.dumps(results, ensure_ascii=False))
     return True, res.stdout
 
 def main():
-    default_dir = "/Users/mwsu/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/s420224237_3aa2/msg/file/2026-10"
-    target_files = [
-        os.path.join(default_dir, "15076191078(1).txt"),
-        os.path.join(default_dir, "15146673939(1).txt"),
-        os.path.join(default_dir, "15223868772(1).txt"),
-        os.path.join(default_dir, "15315036070(1).txt"),
-        os.path.join(default_dir, "15315058382(1).txt"),
-    ]
+    parser = argparse.ArgumentParser(description="批量导入微信导出的 WorkBuddy 文本账号")
+    parser.add_argument(
+        "--dir",
+        default="/Users/mwsu/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/s420224237_3aa2/msg/file/2026-10",
+        help="包含 txt 账号文件的目录",
+    )
+    parser.add_argument("--server", default="34.96.166.42")
+    parser.add_argument("--user", default="mwsu")
+    parser.add_argument("--dry-run", action="store_true", help="只解析，不写入服务器")
+    parser.add_argument("--report", default="", help="解析结果 JSON 报告路径（不含 token）")
+    args = parser.parse_args()
 
-    print(f"[*] 开始解析 {len(target_files)} 个号商文本账号...")
-    accounts = parse_txt_files(target_files)
+    file_paths = sorted(glob.glob(os.path.join(args.dir, "*.txt")))
+    if not file_paths:
+        print(f"[!] 目录中没有 txt 文件: {args.dir}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[*] 目录: {args.dir}")
+    print(f"[*] 发现 {len(file_paths)} 个 txt 文件")
+    accounts = parse_txt_files(file_paths)
     if not accounts:
         print("[!] 没有有效账号可导入，退出。")
         sys.exit(1)
 
+    seen = set()
+    duplicates = []
+    for account in accounts:
+        uid = account["uid"]
+        if uid in seen:
+            duplicates.append(uid)
+        seen.add(uid)
+
+    now = int(time.time())
+    expired = [
+        account
+        for account in accounts
+        if account.get("expiresAt") and int(account["expiresAt"]) < now
+    ]
+
+    print(f"[*] 解析成功 {len(accounts)} 个账号，去重后 {len(seen)} 个 UID")
+    if duplicates:
+        print(f"[!] 文档内重复 UID: {duplicates}")
+    if expired:
+        print(
+            f"[!] {len(expired)} 个 accessToken 已过期，将导入并由 Hub 尝试用 refreshToken 刷新"
+        )
+
+    if args.report:
+        report = [
+            {
+                "phone": account["nickname"],
+                "uid": account["uid"],
+                "expiresAt": account.get("expiresAt"),
+            }
+            for account in accounts
+        ]
+        with open(args.report, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, ensure_ascii=False, indent=2)
+        print(f"[*] 解析报告已写入: {args.report}")
+
+    if args.dry_run:
+        print("[*] dry-run 模式，未写入服务器。")
+        return
+
     print(f"[*] 准备将 {len(accounts)} 个账号推送到香港服务器...")
-    ok, output = deploy_to_server(accounts)
+    ok, output = deploy_to_server(
+        accounts, server_host=args.server, server_user=args.user
+    )
     if not ok:
         sys.exit(1)
+
+    for line in output.splitlines():
+        if line.startswith("IMPORT_REPORT:"):
+            import_report = json.loads(line[len("IMPORT_REPORT:") :])
+            print(
+                "[*] 导入结果: "
+                f"新增 {len(import_report.get('added', []))}, "
+                f"更新 {len(import_report.get('updated', []))}, "
+                f"跳过 {len(import_report.get('skipped', []))}, "
+                f"无效 {len(import_report.get('invalid', []))}"
+            )
+            for item in import_report.get("skipped", []):
+                print(f"    - 跳过: {item}")
+            for item in import_report.get("invalid", []):
+                print(f"    - 无效: {item}")
+        elif line.startswith("CREDITS_REPORT:"):
+            credit_rows = json.loads(line[len("CREDITS_REPORT:") :])
+            failed = [row for row in credit_rows if not row.get("ok")]
+            print(
+                f"[*] 积分刷新: 成功 {len(credit_rows) - len(failed)}, "
+                f"失败 {len(failed)}"
+            )
+            for row in failed:
+                print(
+                    f"    - {row.get('nickname') or row.get('uid')}: {row.get('error')}"
+                )
+
     print("[*] 账号导入全部完成！")
 
 if __name__ == "__main__":
