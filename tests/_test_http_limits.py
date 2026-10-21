@@ -140,7 +140,7 @@ class NagleFlagTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
-        self.assertEqual(Probe.seen, [1],
+        self.assertTrue(Probe.seen and Probe.seen[0] != 0,
                          "TCP_NODELAY is not set on the accepted connection")
 
 

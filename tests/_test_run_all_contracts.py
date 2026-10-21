@@ -174,7 +174,7 @@ def _proc_process_tree(proc_root="/proc"):
     must not have to know which platform filled it in.
     """
     try:
-        names = [n for n in os.listdir(proc_root) if n.isdigit()]
+        names = sorted([n for n in os.listdir(proc_root) if n.isdigit()], key=int)
     except OSError:
         return None
     table = {}
