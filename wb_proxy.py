@@ -37,7 +37,7 @@ import random
 # 503 的先后语义、并让慢客户端占着 slot 拖住信号量；只收紧默认值保守得多——16MB
 # 对正常客户端绰绰有余（Codex 1M token 上下文的 JSON 也只有几 MB），确需更大可
 # 显式设 WB_MAX_PAYLOAD_BYTES，内存代价由运维者自己拍板。
-MAX_PAYLOAD_BYTES = int(os.environ.get("WB_MAX_PAYLOAD_BYTES", 16 * 1024 * 1024))  # 16MB limit
+MAX_PAYLOAD_BYTES = int(os.environ.get("WB_MAX_PAYLOAD_BYTES", 50 * 1024 * 1024))  # 50MB limit
 # Upstream chat calls may hold a handler thread for up to 600s, and every
 # request gets its own thread, so an unbounded pool lets a handful of slow
 # clients pin hundreds of threads and the memory behind them. Bound the number

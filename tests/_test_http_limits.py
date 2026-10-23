@@ -193,21 +193,15 @@ class BacklogTests(unittest.TestCase):
 
 
 class PayloadCapTests(unittest.TestCase):
-    """50MB body 单请求峰值 ~160MB 对 ~480MB 可用内存的护栏。"""
+    """50MB body 单请求上限保护。"""
 
     def test_the_default_cap_is_the_new_value(self):
-        self.assertEqual(P.MAX_PAYLOAD_BYTES, 16 * 1024 * 1024,
-                         "the default body cap must stay at the tightened "
-                         "16MB; 50MB allowed a single request to peak at "
-                         "~160MB on a ~480MB router")
+        self.assertEqual(P.MAX_PAYLOAD_BYTES, 50 * 1024 * 1024,
+                         "the default body cap should be 50MB to match Nginx and new-api-cf")
 
     def test_an_over_limit_body_is_never_read(self):
-        """行为级：Content-Length 超限在解析前就被拒，rfile 一个字节没动。
-
-        旧默认值 50MB 正是「读完再 parse」的那条路；这里用声明 50MB 的请求
-        复现当时的形状，桩上的计数证明它现在连读都不读。
-        """
-        for declared in (50 * 1024 * 1024, P.MAX_PAYLOAD_BYTES + 1):
+        """行为级：Content-Length 超限在解析前就被拒，rfile 一个字节没动。"""
+        for declared in (60 * 1024 * 1024, P.MAX_PAYLOAD_BYTES + 1):
             with self.subTest(content_length=declared):
                 reader = CountingReader()
                 handler = make_handler(
@@ -221,7 +215,7 @@ class PayloadCapTests(unittest.TestCase):
     def test_the_413_reply_path_still_answers(self):
         """超限 -> _payload_or_error 走 413（而不是抛穿线程）。"""
         calls = []
-        handler = make_handler({"Content-Length": str(50 * 1024 * 1024)})
+        handler = make_handler({"Content-Length": str(P.MAX_PAYLOAD_BYTES + 1)})
         handler._error = lambda code, message, err_type="server_error": \
             calls.append((code, message, err_type))
         result = handler._payload_or_error()
@@ -233,13 +227,9 @@ class PayloadCapTests(unittest.TestCase):
         self.assertIn(str(P.MAX_PAYLOAD_BYTES), message)
 
     def test_an_over_limit_body_closes_instead_of_draining(self):
-        """断开路径：_error 的 drain 对超限 body 只置 close_connection。
-
-        读它要等到客户端把 50MB 发完，而回包早已发出——旧行为会一直阻塞在
-        drain 上；这里证明超限时走的是断开而不是读。
-        """
+        """断开路径：_error 的 drain 对超限 body 只置 close_connection。"""
         reader = CountingReader()
-        handler = make_handler({"Content-Length": str(50 * 1024 * 1024)},
+        handler = make_handler({"Content-Length": str(P.MAX_PAYLOAD_BYTES + 1)},
                                rfile=reader)
         handler.close_connection = False
         handler._discard_body()
