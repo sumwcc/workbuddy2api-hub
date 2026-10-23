@@ -58,6 +58,37 @@ WEB_TURN_TIMEOUT = int(os.environ.get("WB_WEB_TURN_TIMEOUT") or "120")
 #: 网页通道一共试几次（含第一轮）。第 N 轮的等待是首轮的 N 倍，所以
 #: 3 次 = 最多等 base×(1+2+4) 秒。设置页可改（见 wb_settings.daily_chat_web_attempts）。
 WEB_TURN_ATTEMPTS = 3
+#: 还没跑到 turn 就失败（建会话 5xx、取沙箱失败）时的退避基数（秒）。
+#: 那几轮只花掉几百毫秒、不消耗任何等待预算，背靠背重试等于把全部尝试挤进
+#: 同一个上游故障窗口（issue #558：8 个账号 × 6 次尝试全落进约 100 秒的抖动）。
+#: 设 0 关闭退避，恢复旧行为。
+WEB_RETRY_BACKOFF = float(os.environ.get("WB_WEB_RETRY_BACKOFF") or "5")
+#: 单次退避上限（秒）：指数增长到它就封顶，避免把整批巡检拖太久。
+WEB_RETRY_BACKOFF_MAX = float(os.environ.get("WB_WEB_RETRY_BACKOFF_MAX") or "30")
+
+
+def web_retry_backoff(round_index, base=None, cap=None):
+    """第 round_index 轮（从 0 起）失败后要等多久，秒；0 表示不退避。
+
+    base 默认取 WB_RETRY_BACKOFF（设置页可改，见 wb_settings.
+    daily_chat_web_retry_backoff）；cap 默认取 WB_RETRY_BACKOFF_MAX，但不会小于
+    base —— 否则操作者把基数调大后会被一个更小的上限悄悄压回去。
+    """
+    base = WEB_RETRY_BACKOFF if base is None else base
+    cap = WEB_RETRY_BACKOFF_MAX if cap is None else cap
+    if base <= 0:
+        return 0.0
+    return min(base * (2 ** round_index), max(cap, base))
+#: 上游对单个账号同时存在的「活跃会话」（status=working）有硬上限，超过就拒绝
+#: 建会话：HTTP 429 / code 10105 "you have reached the maximum number of active
+#: conversations(10)"。每条会话跑完必须收尾，否则每天漏一条，十天后这个账号
+#: 就再也建不出会话（面板上表现为「每日活跃打卡」全部失败）。
+WEB_CONVERSATION_ACTIVE_LIMIT = 10
+#: 撞到上限时自动停掉的旧会话条数上限之外保留的活跃条数。留一点余量，别把用户
+#: 正在网页端使用的会话也停掉。
+WEB_CONVERSATION_PRUNE_KEEP = 8
+#: 上游把「还在跑」的会话记成这些状态；只有它们占活跃名额。
+WEB_CONVERSATION_ACTIVE_STATUSES = ("working", "creating", "pending")
 
 
 class TLSVerifyError(RuntimeError):
@@ -277,10 +308,82 @@ RESOURCE_FREE_PACKAGES_PATH = "/billing/meter/get-user-resource-free-packages"
 RESOURCE_PAID_PACKAGES_PATH = "/billing/meter/get-user-resource-paid-packages"
 CHECKIN_STATUS_PATH = "/v2/billing/meter/checkin-activity-status"
 ENTERPRISE_USAGE_PATH = "/billing/meter/get-enterprise-user-usage"
+#: 静态 API Key 上企业用量走 /v2 前缀（实测）：不带 /v2 的同一路径被 APISIX
+#: 直接回 401 的 HTML 页，带 /v2 才进业务层。OAuth 账号维持原路径不动——
+#: 那一条已经在生产跑着，没有理由陪着改。
+ENTERPRISE_USAGE_PATH_V2 = "/v2/billing/meter/get-enterprise-user-usage"
+
+#: 静态 API Key 的前缀。CodeBuddy 平台签发的 key 形如 ck_<id>.<secret>；
+#: pt_ 是同一套签发体系里见过的另一种前缀。这类凭证不是 JWT：不能刷新、
+#: 没有过期时间、也没有登录账号的个人身份，额度走企业口径端点。
+API_KEY_PREFIXES = ("ck_", "pt_")
+
+#: 静态 API Key 账号的 source 标记。与 OAuth / cockpit / import / desktop-app
+#: 并列，落盘可读，导出导入照常携带。
+SOURCE_API_KEY = "api-key"
+
+
+def api_key_id(token):
+    """从 ck_<id>.<secret> 里取 <id> 段（剥前缀、截到首个点之前）。
+
+    只保留 [A-Za-z0-9_-]：这个值会拼进凭证文件名，净化是路径穿越的防线。
+    """
+    text = str(token or "")
+    for prefix in API_KEY_PREFIXES:
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    if "." in text:
+        text = text.split(".", 1)[0]
+    return re.sub(r"[^A-Za-z0-9_-]", "", text)
+
+
+def is_api_key_token(token):
+    """该凭证是不是静态 API Key（ck_/pt_ 前缀）。
+
+    判据只有前缀：静态 Key 没有本地可校验的签名，唯一可靠的验证是拿它打一次
+    上游（见 Account.probe_api_key）。
+    """
+    return str(token or "").startswith(API_KEY_PREFIXES)
+
+#: 账号档位（付费 / 免费）的有效期。计费摘要里的 `IsPaidUser` 只在真正
+#: 刷新时读一次，一天一次足够：档位不会分钟级变化，而这是国际版唯一一次
+#: 额外的计费请求（国内版的详细积分路径本来就在打同一个接口，见 #505）。
+TIER_TTL_SECONDS = 24 * 3600.0
 
 LOGIN_PENDING = 11217
 LOGIN_TTL_SECONDS = 600
 USER_AGENT = REALM_CONFIGS['intl']['chat_ua']
+
+#: 签到文案判据。10001 在本仓库**不是**「签到成功」专属码：活动补偿的
+#: 「每人限领一次，您已领取过」与 content rejected 都用它，上游还会在
+#: code=0 下回「签到失败，已签到天数不足 7 天」。原先 `code == 0 or
+#: code == 10001` 一律当成功，把「请求处理中，请勿重复操作」这种明确没签成
+#: 的回执也记成了成功（实测一轮 27 个账号里 4 条，当天真签成 8 个）。
+CHECKIN_PENDING_HINTS = ("处理中", "请勿重复操作", "系统繁忙", "稍后再试")
+CHECKIN_ALREADY_HINTS = ("已签到",)
+CHECKIN_FAILURE_HINTS = ("失败",)
+
+
+def checkin_state(code, msg):
+    """把签到回执归成 checked / already / pending / failed。
+
+    只有 checked / already 能写 last_checkin：写早了（旧实现拿到 HTTP 200 就
+    先写盘）会让当天 can_checkin() 恒为 False，这次失败被永久放弃，9 点与
+    21 点两轮再也不会重试，面板还显示「今日已领」。
+    """
+    text = str(msg or "")
+    if any(k in text for k in CHECKIN_PENDING_HINTS):
+        return "pending"
+    if code == 0:
+        # 「失败」是唯一的硬词：CHECKIN_FAILURE_HINTS 之外的口径太宽，
+        # 「签到成功，距离 7 天奖励还不足」里的「不足」会把成功判成失败。
+        return "failed" if any(k in text for k in CHECKIN_FAILURE_HINTS) else "checked"
+    if code == 10001:
+        return "already" if any(k in text for k in CHECKIN_ALREADY_HINTS) else "failed"
+    return "failed"
+
+
 #: 国际版桌面端的版本号。以前这里硬编码 5.5.2，和 wb_identity 的
 #: DESKTOP_VERSION_INTL 各写一份，改版本时容易只改一处（5.8.4 对齐时
 #: 就漏了这个常量）。现在统一从 wb_identity 取，保持单一来源。
@@ -288,6 +391,34 @@ DEFAULT_UA_VERSION = wb_identity.DESKTOP_VERSION_INTL
 
 def get_realm_config(realm):
     return REALM_CONFIGS.get(realm) or REALM_CONFIGS["intl"]
+
+
+def tier_from_summary(data):
+    """Normalise one billing-summary payload into a tier record (#505).
+
+    Both realms answer the same fields on `/billing/meter/get-user-resource-summary`;
+    intl omits `ProTrialStatus`. `SubscriptionPackageCode` was empty on every
+    account measured, so the package *name* is what gets displayed.
+
+    Returns None when the payload carries no `IsPaidUser`: "no answer" must
+    never be recorded as "free".
+    """
+    if not isinstance(data, dict) or "IsPaidUser" not in data:
+        return None
+    try:
+        trial = int(data.get("ProTrialStatus") or 0)
+    except (TypeError, ValueError):
+        trial = 0
+    return {
+        "paid": bool(data.get("IsPaidUser")),
+        "package": str(data.get("SubscriptionPackageName") or ""),
+        "package_code": str(data.get("SubscriptionPackageCode") or ""),
+        "protected_price": bool(data.get("IsProtectedPriceUser")),
+        "trial": trial,
+        "checked_at": time.time(),
+        "source": "billing",
+    }
+
 
 def _jwt_claims(token):
     try:
@@ -597,6 +728,22 @@ def _model_credit_rank(model, realm):
     return float("inf")
 
 
+def _active_conversation_limit(status, detail):
+    """Whether an upstream rejection means "no free active-conversation slot".
+
+    The console API answers HTTP 429 with code 10105 and a message like
+    "CreateConversation: 10105:you have reached the maximum number of active
+    conversations(10), please c...". Matching the code alone is enough, but the
+    message is checked too so a proxy that rewrites the body still gets the
+    recovery path instead of a bare 429.
+    """
+    if status != 429:
+        return False
+    text = str(detail or "")
+    return ("10105" in text
+            or "maximum number of active conversations" in text.lower())
+
+
 class Account(object):
     def __init__(self, data, path=None):
         data = data or {}
@@ -605,7 +752,17 @@ class Account(object):
         # optional X-Device-Token) can resolve settings without a pool lookup.
         self.accounts_dir = os.path.dirname(path) if path else ""
         token = str(data.get("accessToken") or "")
-        self.uid = str(data.get("uid") or jwt_uid(token))
+        # 静态 API Key 与 OAuth token 是两条鉴权路径：前者不是 JWT，没有
+        # refreshToken / 过期时间 / 个人身份，也不该走任何刷新与签到逻辑。
+        # 先定这个标志，后面所有「是不是 JWT 账号」的分支都读它。
+        self.is_api_key = is_api_key_token(token)
+        # 静态 Key 解析不出 sub 声明，uid 只能来自落盘字段或 key 的 <id> 段
+        # （ck_<id>.<secret> → apikey-<id>，与 Go 版面板同一口径）。
+        uid = str(data.get("uid") or "").strip()
+        if not uid and self.is_api_key:
+            derived = api_key_id(token)
+            uid = ("apikey-" + derived) if derived else ""
+        self.uid = uid or jwt_uid(token)
         # The CN desktop build stores its nickname as an encrypted envelope
         # ({"$wbEncrypted": ...}) rather than plain text. Stringifying that would
         # paint an entire dictionary into the account row, so anything that is not
@@ -616,7 +773,12 @@ class Account(object):
         else:
             self.nickname = ""
         self.domain = str(data.get("domain") or "")
-        self.realm = str(data.get("realm") or detect_realm_from_token(token, self.domain))
+        if self.is_api_key:
+            # 静态 Key 只在国内版出口有效（国际版不认这套签发），落盘写着
+            # intl 也不能照单全收——那会让每个请求打到不支持它的上游。
+            self.realm = "cn"
+        else:
+            self.realm = str(data.get("realm") or detect_realm_from_token(token, self.domain))
         if not self.domain:
             self.domain = get_realm_config(self.realm)["domain"]
         self.platform = str(data.get("platform") or "CLI")
@@ -629,14 +791,18 @@ class Account(object):
         self.enterprise_id = str(data.get("enterpriseId") or "")
         self.access_token = token
         self.refresh_token = str(data.get("refreshToken") or "")
-        self.expires_at = normalize_epoch(data.get("expiresAt")) or jwt_exp(token)
+        # 静态 Key 永不过期（expiresAt 恒 0）。写 0 而不是「解 JWT 得到的 0」
+        # 是有意的：ready() 里 exp 为 0 表示「不按时间淘汰」。
+        self.expires_at = (0 if self.is_api_key
+                           else normalize_epoch(data.get("expiresAt")) or jwt_exp(token))
         # 企业账号登录时切到企业空间（token_source=enterprise_switch），企业 id
         # 只写在 token 里，凭据文件的 enterpriseId 往往是空的。不回填的话每个
         # 请求都会带上 X-No-Enterprise-Id: 1，企业目录/配额分支走错。
         if not self.enterprise_id:
             self.enterprise_id = self.jwt_enterprise_id(token)
         self.added_at = data.get("addedAt") or time.time()
-        self.source = str(data.get("source") or "oauth")
+        self.source = str(data.get("source")
+                          or (SOURCE_API_KEY if self.is_api_key else "oauth"))
         self.proxy_slot = str(data.get("proxySlot") or "").strip()
         self.proxy_legacy = str(data.get("proxy") or "").strip()
         # Runtime-resolved value; recomputed by AccountPool.apply_proxy_slots().
@@ -733,13 +899,20 @@ class Account(object):
         # 最近一次软限流（429）的时刻：两条软限流阶梯用同一个时间窗。
         self.last_soft_at = 0.0
         self.credits = data.get("credits") or None
-        # Whether the upstream says this is a paid (PRO) account. Read from the
-        # last credits snapshot the account saved; an account that never
-        # refreshed credits is treated as free, so a PRO-only model is not
-        # handed to it before the tier is known.
-        self.is_paid_user = bool(
-            self.credits.get("is_paid_user")
-            if isinstance(self.credits, dict) else False)
+        # 账号档位，来自计费摘要（#505）：{paid, package, package_code,
+        # protected_price, trial, checked_at, source}。企业账号不写——上游对
+        # 它们的 IsPaidUser 语义还没验证过（见 _fetch_tier_summary）。
+        self.tier = data.get("tier") if isinstance(data.get("tier"), dict) else None
+        # Whether the upstream says this is a paid (PRO) account. The billing
+        # summary is authoritative once it has answered (#505); otherwise fall
+        # back to the last credits snapshot. An account that never refreshed is
+        # treated as free, so a PRO-only model is not handed to it before the
+        # tier is known.
+        paid = self.tier_paid()
+        if paid is None:
+            paid = bool(self.credits.get("is_paid_user")
+                        if isinstance(self.credits, dict) else False)
+        self.is_paid_user = paid
         self.last_checkin = data.get("lastCheckin") or None
         self.last_daily_chat = data.get("lastDailyChat") or None
         # 国内版每天一次的「对话活跃上报」（点亮官方 growth 连登/热力墙）上次
@@ -847,6 +1020,9 @@ class Account(object):
             "expiresAt": self.expires_at,
             "addedAt": self.added_at,
             "source": self.source,
+            # 静态 API Key 账号：面板据此渲染「API Key」标签并隐藏签到/任务，
+            # 导入导出也靠它把账号还原成同一类型。
+            "apiKey": bool(self.is_api_key),
             "proxySlot": self.proxy_slot,
             "proxy": self.proxy_legacy,
             "enabled": self.enabled,
@@ -861,6 +1037,10 @@ class Account(object):
             # normalise_import_row() 不认这个字段，换机器不会把账号一起停掉。
             "restrictedUntil": self.restricted_until,
             "credits": self.credits,
+            # 账号档位（#505）。持久化：一天一次的计费摘要结论，重启后仍然
+            # 有效；导入到另一台机器时按 VOLATILE_FIELDS 丢掉，不把上一台
+            # 机器的档位当成结论。
+            "tier": self.tier,
             "lastCheckin": self.last_checkin,
             "lastDailyChat": self.last_daily_chat,
             "lastActivityReport": self.last_activity_report,
@@ -919,6 +1099,8 @@ class Account(object):
             "note": self.note,
             "disabledModels": list(self.disabled_models),
             "source": self.source,
+            "apiKey": bool(self.is_api_key),
+            "credentialMask": self.credential_mask(),
             "proxySlot": self.proxy_slot,
             "proxy": self.proxy,
             "expiresAt": exp,
@@ -946,6 +1128,8 @@ class Account(object):
             "addedAt": self.added_at,
             "file": os.path.basename(self.path) if self.path else None,
             "credits": self.credits,
+            # 账号档位（#505）：面板在「会员类型」旁显示包名与读取时刻。
+            "tier": self.tier,
             "reserveCredits": int(self.reserve_credits or 0),
             "reserveBlocked": self.reserve_blocked(),
             "dailyTokenLimit": int(self.daily_token_limit or 0),
@@ -966,12 +1150,58 @@ class Account(object):
             "lastCheckin": self.last_checkin,
             "lastDailyChat": self.last_daily_chat,
             "lastActivityReport": self.last_activity_report,
-            "canCheckin": self.realm == "cn" and not self.is_enterprise(),
+            "canCheckin": self.realm == "cn" and not self.uses_enterprise_billing(),
             "canDailyChat": self.realm == "intl",
-            "canReportActivity": self.realm == "cn" and not self.is_enterprise(),
+            "canReportActivity": (self.realm == "cn"
+                                  and not self.uses_enterprise_billing()),
             "machineId": derive_id(self.uid, "machine"),
             "sessionId": session_id(self.uid),
         }
+
+    def credential_mask(self):
+        """脱敏后的凭证：静态 Key 显示 `ck_<id>.***`，OAuth token 不回显。
+
+        OAuth token 是一串完整可用的凭证，面板从来没有展示过它，这里继续
+        返回空串而不是「前四位 + 后四位」——那已经足够在日志里定位，也足够
+        让人误以为面板可以拿回原值。
+        """
+        if not self.is_api_key:
+            return ""
+        token = str(self.access_token or "")
+        head = token.split(".", 1)[0]
+        return (head + ".***") if head else "***"
+
+    def probe_api_key(self, timeout=15):
+        """用企业额度端点验一次这个 Key 是否有效。
+
+        静态 Key 没有任何本地可校验的签名字段，唯一可靠的验证就是拿它打一次
+        真实端点。加账号时必须先探再落盘：探测失败的 key 进了池子，选号侧会
+        反复选中它、每次失败都要冷却换号，表象是「网关时好时坏」。
+        """
+        if not self.is_api_key:
+            return {"ok": False, "error": "not an API key"}
+        url = get_realm_config("cn")["billing_upstream"] + ENTERPRISE_USAGE_PATH_V2
+        headers = {
+            "Authorization": "Bearer " + str(self.access_token or ""),
+            # 官方 CLI 两个头都发；这里同样两个都给，省得探测通过、真跑却
+            # 因为少了另一个头被判成不同的调用方。
+            "X-API-Key": str(self.access_token or ""),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": get_realm_config("cn")["chat_ua"],
+        }
+        try:
+            res = http_json(url, data=b"{}", method="POST", headers=headers,
+                            timeout=timeout, proxy=self.proxy)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        if not isinstance(res, dict) or res.get("code") != 0:
+            return {"ok": False,
+                    "error": "code %s: %s" % (res.get("code"), res.get("msg"))}
+        data = res.get("data") or {}
+        return {"ok": True, "used": data.get("credit"),
+                "limit": data.get("limitNum"),
+                "cycle_end": data.get("cycleEndTime")}
 
     def save(self, directory):
         os.makedirs(directory, exist_ok=True)
@@ -1472,6 +1702,10 @@ class Account(object):
                 "X-Machine-ID": derive_id(self.uid, "machine"),
                 "X-Session-ID": session_id(self.uid),
             }
+            # 静态 API Key：与 chat 链路口径一致，两个鉴权头都发。计费端点
+            # 本身任一个都认，但统一形态省得两条路径各写一套。
+            if self.is_api_key:
+                headers["X-API-Key"] = self.access_token
             if self.enterprise_id:
                 headers["X-Enterprise-Id"] = self.enterprise_id
                 headers["X-Tenant-Id"] = self.enterprise_id
@@ -1585,6 +1819,11 @@ class Account(object):
             return self._refresh_locked()
 
     def _refresh_locked(self):
+        if self.is_api_key:
+            # 静态 Key 无法 refresh（refresh 端点只认 OAuth 设备流）。返回
+            # False 而不是把 token_expired 置 True：这类账号按定义就是长期
+            # 有效，标成「过期」会把一个健康的号踢出池子并要求重新登录。
+            return False
         if not self.refresh_token:
             self.token_expired = True
             self._set_last_error("no refresh token; sign in again")
@@ -1646,7 +1885,8 @@ class Account(object):
     def can_checkin(self):
         if self.realm != "cn":
             return False
-        if self.is_enterprise():
+        # 无个人成长体系：企业号上游直接拒，静态 Key 连个人身份都没有。
+        if self.uses_enterprise_billing():
             return False
         if not self.last_checkin:
             return True
@@ -1665,7 +1905,7 @@ class Account(object):
         """国内版每天一次的对话活跃上报（点亮 growth 连登）是否还没做过。"""
         if self.realm != "cn":
             return False
-        if self.is_enterprise():
+        if self.uses_enterprise_billing():
             return False
         if not self.last_activity_report:
             return True
@@ -1799,6 +2039,9 @@ class Account(object):
         120 / 240 / 360。最典型的失败是「会话还没跑完」（状态=working），它往往
         只是慢，多等一轮就好，所以这里把等待时间当成重试的代价，不再额外 sleep。
         业务拒绝（建会话返回非 0 code）不再试：同一个被拒的请求再发一次也一样被拒。
+        例外是「还没跑到 turn 就失败」的轮次（建会话 5xx、取沙箱失败）：那几轮
+        一秒都没等，再打一次仍落在同一个上游故障窗口里，所以补一段指数退避
+        （见 _web_retry_pause / web_retry_backoff）。
 
         返回里带 attempts（实际跑了几轮），其余字段与 _daily_chat_web_once 一致。
         """
@@ -1826,6 +2069,8 @@ class Account(object):
                     if not res.get("retryable"):
                         return res
                     tried.append(model)
+                    if attempt + 1 < attempts:
+                        self._web_retry_pause(res, attempt)
                 return last
         attempt = 0
         while True:
@@ -1833,7 +2078,36 @@ class Account(object):
             res["attempts"] = attempt + 1
             if res.get("ok") or attempt + 1 >= total or not res.get("retryable"):
                 return res
+            self._web_retry_pause(res, attempt)
             attempt += 1
+
+    def _web_retry_pause(self, res, round_index):
+        """还没跑到 turn 就失败时补一段退避，返回实际等了多少秒。
+
+        跑过 turn 的轮次已经把等待预算（wait_seconds）花掉了，再睡一次就是双重
+        惩罚；而建会话 / 取沙箱失败只用掉几百毫秒，背靠背重试会把所有尝试挤进
+        同一个上游故障窗口。phase 缺失时按「已跑到 turn」处理，旧调用方和测试
+        桩返回的结果形状因此保持原样。
+        """
+        if res.get("phase") not in ("create", "session"):
+            return 0.0
+        delay = web_retry_backoff(round_index,
+                                  base=self.daily_chat_web_retry_backoff())
+        if delay > 0:
+            time.sleep(delay)
+        return delay
+
+    def daily_chat_web_retry_backoff(self):
+        """建会话 / 取沙箱阶段失败后的退避基数（秒）。设置页改过就按设置页的来。
+
+        没配过时用内置默认 WEB_RETRY_BACKOFF —— 它吃 WB_WEB_RETRY_BACKOFF
+        环境变量，别让这个新设置项把它悄悄顶掉。没配 settings 的账号（单测里
+        手工构造的）同样按内置默认走。0 = 不退避（旧行为）。
+        """
+        if not self.path:
+            return WEB_RETRY_BACKOFF
+        return wb_settings.daily_chat_web_retry_backoff(
+            os.path.dirname(self.path), default=WEB_RETRY_BACKOFF)
 
     def daily_chat_web_policy(self):
         """(首轮等待秒数, 总尝试次数)。设置页改过就按设置页的来。
@@ -1859,6 +2133,9 @@ class Account(object):
         结果里的 retryable 说明这一轮的失败值不值得再试一次（重试策略见
         _daily_chat_web_upstream）。model 为空时按账号首选模型；回退模式显式
         传入当前候选，保证建会话与 session/set_model 用的是同一个模型。
+
+        phase 标出失败停在哪一步：create（建会话）/ session（取沙箱）/ turn
+        （接上沙箱跑这一轮）。重试方按它判断这一轮到底有没有花掉等待预算。
         """
         if wait_seconds is None:
             wait_seconds = WEB_TURN_TIMEOUT
@@ -1871,58 +2148,68 @@ class Account(object):
             "conversationOrigin": "workbuddy-app",
             "plugins": [{"name": "weixinpay", "marketplace": "codebuddy-builtin"}],
         }
-        req = urllib.request.Request(
-            WEB_CONVERSATIONS_URL,
-            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            headers=self.web_headers(), method="POST")
+        conversation, failure = self._web_conversation_create(body)
+        if failure and failure.get("limit"):
+            # 账号攒满了活跃会话：老版本每跑一次就漏一条、从不清尾，十天后连建都
+            # 建不出来。先停掉最旧的本网关会话把名额腾出来，再建一次；腾不出来就
+            # 直接告诉用户去网页端收尾，不再拿重试次数去撞同一堵墙。
+            freed = self.web_conversation_prune()
+            if freed:
+                conversation, failure = self._web_conversation_create(body)
+            if failure:
+                hint = ("已自动结束 %d 条旧会话" % freed) if freed \
+                    else "没有可自动结束的旧会话"
+                return {"ok": False,
+                        "error": "活跃会话已达上限（%d）：%s；请到 %s 网页端结束或删除"
+                                 "旧对话后重试"
+                                 % (WEB_CONVERSATION_ACTIVE_LIMIT, hint,
+                                    WEB_ORIGIN.replace("https://", "")),
+                        "retryable": False}
+        if failure:
+            return {"ok": False, "error": failure.get("message") or "建会话失败",
+                    "retryable": bool(failure.get("retryable")),
+                    "phase": "create"}
+
+        keep = False
         try:
-            with urlopen(req, timeout=30, proxy=self.proxy) as resp:
-                payload = json.loads(resp.read().decode("utf-8", "replace") or "{}")
-        except urllib.error.HTTPError as exc:
+            # 建完只是排队：接上沙箱、请求这一轮，它才会真的跑起来（issue #90）。
             try:
-                detail = exc.read().decode("utf-8", "replace")
-            except Exception:
-                detail = str(exc)
-            return {"ok": False, "error": "HTTP %d: %s" % (exc.code, detail[:120]),
-                    "retryable": exc.code >= 500 or exc.code in (408, 429)}
-        except Exception as exc:
-            return {"ok": False, "error": str(exc), "retryable": True}
-        if not isinstance(payload, dict):
-            return {"ok": False, "error": "unexpected response", "retryable": True}
-        conversation = (payload.get("data") or {}).get("id")
-        if payload.get("code") not in (0, None) or not conversation:
-            return {"ok": False, "error": "code=%s msg=%s"
-                    % (payload.get("code"), payload.get("msg")),
-                    "retryable": False}
+                session = (self._web_conversation_get(conversation, "/session") or {}).get("data") or {}
+            except Exception as exc:
+                return {"ok": False, "conversation": conversation,
+                        "error": "session 查询失败: %s" % exc, "retryable": True,
+                        "phase": "session"}
+            link = session.get("link") or session.get("endpoint") or ""
+            token = session.get("token") or ""
+            session_id = session.get("sessionId") or session.get("session_id") or conversation
+            cwd = session.get("cwd") or "/workspace"
+            if not link or not token:
+                return {"ok": False, "conversation": conversation,
+                        "error": "沙箱未就绪（没有 link/token）", "retryable": True,
+                        "phase": "session"}
 
-        # 建完只是排队：接上沙箱、请求这一轮，它才会真的跑起来（issue #90）。
-        try:
-            session = (self._web_conversation_get(conversation, "/session") or {}).get("data") or {}
-        except Exception as exc:
-            return {"ok": False, "conversation": conversation,
-                    "error": "session 查询失败: %s" % exc, "retryable": True}
-        link = session.get("link") or session.get("endpoint") or ""
-        token = session.get("token") or ""
-        session_id = session.get("sessionId") or session.get("session_id") or conversation
-        cwd = session.get("cwd") or "/workspace"
-        if not link or not token:
-            return {"ok": False, "conversation": conversation,
-                    "error": "沙箱未就绪（没有 link/token）", "retryable": True}
-
-        result = wb_webagent.run_turn(
-            link, token, session_id, cwd, chosen_prompt,
-            WEB_USER_AGENT,
-            poll_status=lambda: self._web_conversation_status(conversation),
-            wait_seconds=wait_seconds, proxy=self.proxy,
-            model=model)
-        result["conversation"] = conversation
-        result["model"] = model
-        if result.get("ok"):
-            result["msg"] = "网页通道会话跑完（%s）：%d 段输出，%d ms" % (
-                model, result.get("chunks") or 0, result.get("elapsed_ms") or 0)
-        else:
-            result["retryable"] = True
-        return result
+            result = wb_webagent.run_turn(
+                link, token, session_id, cwd, chosen_prompt,
+                WEB_USER_AGENT,
+                poll_status=lambda: self._web_conversation_status(conversation),
+                wait_seconds=wait_seconds, proxy=self.proxy,
+                model=model)
+            result["conversation"] = conversation
+            result["model"] = model
+            result["phase"] = "turn"
+            if result.get("ok"):
+                keep = True
+                result["msg"] = "网页通道会话跑完（%s）：%d 段输出，%d ms" % (
+                    model, result.get("chunks") or 0, result.get("elapsed_ms") or 0)
+            else:
+                result["retryable"] = True
+            return result
+        finally:
+            # 收尾必须发生：不 stop 的话这条会话会一直占着上游的活跃名额，跑够十次
+            # 这个账号就再也建不出会话（HTTP 429 / 10105）。成功的一轮保留记录
+            # （stop 只把状态改成 completed），失败的一轮直接删掉，免得网页端历史
+            # 里堆满「Hi」。
+            self.web_conversation_release(conversation, delete=not keep)
 
     def _web_conversation_get(self, conversation, suffix=""):
         """读一条网页端会话（suffix 为空拿会话本身，"/session" 拿沙箱信息）。"""
@@ -1939,6 +2226,127 @@ class Account(object):
             return ""
         data = payload.get("data") if isinstance(payload, dict) else None
         return str((data or {}).get("status") or "")
+
+    # ---- 网页会话的收尾与名额回收 -----------------------------------------
+    # 上游对每个账号同时存在的活跃会话（status=working）有硬上限 10 条，而每条
+    # 每日活跃都会新建一条。只建不收尾的话，每天漏一条、每次重试再漏一条，攒满
+    # 十条之后 CreateConversation 直接 429 / 10105，打卡就再也做不成了。
+
+    def _web_conversation_call(self, conversation, action):
+        """对一条网页会话执行动作（stop / delete），返回上游是否接受。
+
+        清理是收尾动作，任何异常都不能冒泡：一轮已经跑完的活跃不能因为收尾失败
+        被改判成失败。
+        """
+        if not conversation:
+            return False
+        url = (WEB_CONVERSATIONS_URL + urllib.parse.quote(str(conversation))
+               + "/" + action)
+        req = urllib.request.Request(url, data=b"{}",
+                                     headers=self.web_headers(), method="POST")
+        try:
+            with urlopen(req, timeout=20, proxy=self.proxy) as resp:
+                payload = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+        except Exception:
+            return False
+        return isinstance(payload, dict) and payload.get("code") in (0, None)
+
+    def web_conversation_release(self, conversation, delete=False):
+        """结束一条网页会话，释放它占的活跃名额。
+
+        默认只 stop：会话留在网页端历史里，状态从 working 变成 completed，名额
+        随即释放。delete=True 时再删掉它——失败轮次没有保留价值，删掉免得网页端
+        塞满「Hi」。
+        """
+        if not conversation:
+            return False
+        stopped = self._web_conversation_call(conversation, "stop")
+        if delete:
+            return self._web_conversation_call(conversation, "delete") or stopped
+        return stopped
+
+    def web_conversation_list(self, page_size=50):
+        """读账号的网页会话列表（上游按创建时间倒序返回）。"""
+        url = WEB_CONVERSATIONS_URL + "?page=1&pageSize=%d" % max(1, int(page_size))
+        req = urllib.request.Request(url, headers=self.web_headers(), method="GET")
+        with urlopen(req, timeout=20, proxy=self.proxy) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+        data = (payload if isinstance(payload, dict) else {}).get("data") or {}
+        conversations = data.get("conversations")
+        return conversations if isinstance(conversations, list) else []
+
+    def _daily_activity_prompt_pool(self):
+        """本网关可能用作会话名的提示词（内置池 + 操作者自定义）。"""
+        pool = set(wb_webprompts.builtin_prompts())
+        try:
+            if self.path:
+                pool.update(wb_settings.daily_chat_web_prompts(
+                    os.path.dirname(self.path)))
+        except Exception:
+            pass
+        pool.add(DAILY_CHAT_WEB_PROMPT)
+        return pool
+
+    def web_conversation_prune(self, keep=WEB_CONVERSATION_PRUNE_KEEP):
+        """停掉最旧的活跃会话，把账号拉回上限以下；返回停掉的条数。
+
+        只在撞到 10105 时调用，用来收拾老版本漏下的会话。按创建时间从旧到新停，
+        且只动名字属于每日活跃提示词池的会话——用户自己在网页端的真实对话不碰。
+        stop 不是删除：会话仍在网页端历史里，只是不再占活跃名额。
+        """
+        try:
+            conversations = self.web_conversation_list()
+        except Exception:
+            return 0
+        active = [c for c in conversations
+                  if str((c or {}).get("status") or "").lower()
+                  in WEB_CONVERSATION_ACTIVE_STATUSES]
+        if len(active) < WEB_CONVERSATION_ACTIVE_LIMIT:
+            return 0
+        active.sort(key=lambda c: str((c or {}).get("createdAt") or ""))
+        pool = self._daily_activity_prompt_pool()
+        stopped = 0
+        for conversation in active:
+            if len(active) - stopped <= keep:
+                break
+            if str((conversation or {}).get("name") or "").strip() not in pool:
+                continue
+            if self._web_conversation_call(conversation.get("id"), "stop"):
+                stopped += 1
+        return stopped
+
+    def _web_conversation_create(self, body):
+        """建一条网页会话；返回 (会话 id, 失败信息)。
+
+        失败信息是 {"message": ..., "retryable": bool, "limit": bool}，limit 表示
+        「活跃会话已满」——调用方会先清理再重试一次。
+        """
+        req = urllib.request.Request(
+            WEB_CONVERSATIONS_URL,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers=self.web_headers(), method="POST")
+        try:
+            with urlopen(req, timeout=30, proxy=self.proxy) as resp:
+                payload = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", "replace")
+            except Exception:
+                detail = str(exc)
+            return None, {"message": "HTTP %d: %s" % (exc.code, detail[:120]),
+                          "retryable": exc.code >= 500 or exc.code in (408, 429),
+                          "limit": _active_conversation_limit(exc.code, detail)}
+        except Exception as exc:
+            return None, {"message": str(exc), "retryable": True, "limit": False}
+        if not isinstance(payload, dict):
+            return None, {"message": "unexpected response", "retryable": True,
+                          "limit": False}
+        conversation = (payload.get("data") or {}).get("id")
+        if payload.get("code") not in (0, None) or not conversation:
+            return None, {"message": "code=%s msg=%s" % (payload.get("code"),
+                                                         payload.get("msg")),
+                          "retryable": False, "limit": False}
+        return conversation, None
 
     def daily_chat(self, web=None, trigger="unknown"):
         """国际版每日活跃对话（官方每日活跃 30/50 积分）。
@@ -2050,6 +2458,8 @@ class Account(object):
         """
         if self.realm != "cn":
             return {"ok": False, "error": "checkin is only available for CN realm accounts"}
+        if self.is_api_key:
+            return {"ok": False, "error": "API key accounts have no checkin programme"}
         if self.is_enterprise():
             return {"ok": False, "error": "enterprise accounts do not support checkin"}
         res = self._checkin_upstream()
@@ -2066,24 +2476,30 @@ class Account(object):
                                 proxy=self.proxy)
             code = payload.get("code", -1)
             msg = payload.get("msg") or "ok"
-            self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
-            if self.path and os.path.exists(os.path.dirname(self.path)):
-                self.save(os.path.dirname(self.path))
-            return {"ok": (code == 0 or code == 10001), "code": code, "msg": msg, "data": payload.get("data")}
+            state = checkin_state(code, msg)
+            if state in ("checked", "already"):
+                self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
+                if self.path and os.path.exists(os.path.dirname(self.path)):
+                    self.save(os.path.dirname(self.path))
+                return {"ok": True, "state": state, "code": code, "msg": msg,
+                        "data": payload.get("data")}
+            return {"ok": False, "state": state, "code": code, "msg": msg, "error": msg}
         except urllib.error.HTTPError as exc:
             try:
                 raw_b = exc.read().decode("utf-8") or "{}"
                 body = json.loads(raw_b)
                 code = body.get("code")
                 msg = body.get("msg") or ("HTTP %d" % exc.code)
-                # 上游如果在今日已签到时返回 HTTP 400 且 code 为 10001 / "今天已签到"
-                # 这说明今日事实上已经处于签到完成状态，按成功处理，并记录最后签到时间
-                if code == 10001 or "今天已签到" in msg or "已签到" in msg:
+                # 上游如果在今日已签到时返回 HTTP 400 且文案写「今天已签到」，
+                # 说明今日事实上已处于签到完成状态，按成功处理并记录时间。
+                state = checkin_state(code, msg)
+                if state == "already":
                     self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
                     if self.path and os.path.exists(os.path.dirname(self.path)):
                         self.save(os.path.dirname(self.path))
-                    return {"ok": True, "code": code, "msg": msg, "data": body.get("data")}
-                return {"ok": False, "error": msg}
+                    return {"ok": True, "state": state, "code": code, "msg": msg,
+                            "data": body.get("data")}
+                return {"ok": False, "state": state, "code": code, "msg": msg, "error": msg}
             except Exception:
                 return {"ok": False, "error": "HTTP %d" % exc.code}
         except Exception as exc:
@@ -2100,6 +2516,8 @@ class Account(object):
         """
         if self.realm != "cn":
             return {"ok": False, "error": "activity report is only for CN realm accounts"}
+        if self.is_api_key:
+            return {"ok": False, "error": "API key accounts have no activity programme"}
         if self.is_enterprise():
             return {"ok": False, "error": "enterprise accounts do not support activity report"}
         import wb_tasks
@@ -2242,6 +2660,16 @@ class Account(object):
         if s_res.get("code") != 0:
             return {"ok": False, "error": s_res.get("msg") or f"code {s_res.get('code')}"}
         s_data = s_res.get("data") or {}
+        # 同一份摘要顺带给出档位（#505）：国内版的详细积分路径本来就在打这个
+        # 接口，不额外花请求。企业账号跳过——上游对它们的 IsPaidUser 语义
+        # 还没验证过，写进去会把「企业额度」覆盖成「免费」。
+        if not self.is_enterprise():
+            tier = tier_from_summary(s_data)
+            if tier:
+                self.apply_tier(tier)
+        paid_flag = self.tier_paid()
+        if paid_flag is None:
+            paid_flag = bool(s_data.get("IsPaidUser"))
         summary_pkgs = s_data.get("Packages") or []
         pkg_codes = [p.get("PackageCode") for p in summary_pkgs if p.get("PackageCode")]
 
@@ -2343,7 +2771,7 @@ class Account(object):
             "size": tot_size,
             "used_percent": f"{(tot_used / tot_size * 100):.1f}%" if tot_size > 0 else "0.0%",
             "remain_percent": f"{(tot_remain / tot_size * 100):.1f}%" if tot_size > 0 else "100.0%",
-            "is_paid_user": bool(s_data.get("IsPaidUser")),
+            "is_paid_user": paid_flag,
             "checkin": checkin_info,
             "earliest_expiring": earliest_expiring,
             "packages": packages,
@@ -2426,7 +2854,9 @@ class Account(object):
             "size": tot_size,
             "used_percent": f"{(tot_used / tot_size * 100):.1f}%" if tot_size > 0 else "0.0%",
             "remain_percent": f"{(tot_remain / tot_size * 100):.1f}%" if tot_size > 0 else "100.0%",
-            "is_paid_user": False,
+            # 国际版的 `get-user-resource` 没有档位字段，这里用计费摘要的结论
+            # （#505）；摘要还没跑过时按免费处理，与旧行为一致。
+            "is_paid_user": bool(self.tier_paid()),
             "checkin": getattr(self, "credits", {}).get("checkin") if isinstance(getattr(self, "credits", None), dict) else None,
             "earliest_expiring": earliest_expiring,
             "packages": packages,
@@ -2454,6 +2884,15 @@ class Account(object):
         """
         return bool(self.enterprise_id or self.jwt_enterprise_id())
 
+    def uses_enterprise_billing(self):
+        """额度是不是该走企业口径端点。
+
+        静态 API Key 也走这一条：它没有个人账号身份，个人
+        get-user-resource 对它返回 200 但 Accounts 为空（实测），复用个人
+        逻辑的话余额恒 0，积分保底会把可用号当成耗尽号挡死。
+        """
+        return bool(self.is_api_key or self.is_enterprise())
+
     def _fetch_credits_enterprise(self):
         """企业账号积分：周期内已用 + 周期额度，剩余 = 额度 - 已用。
 
@@ -2462,7 +2901,10 @@ class Account(object):
         所以合成一个包条目，让看板的明细弹窗与到期提示照常工作。
         """
         cfg = get_realm_config(self.realm)
-        url = cfg["billing_upstream"] + ENTERPRISE_USAGE_PATH
+        # 静态 Key 必须走 /v2 前缀（见 ENTERPRISE_USAGE_PATH_V2 的注释）。
+        path = (ENTERPRISE_USAGE_PATH_V2 if self.is_api_key
+                else ENTERPRISE_USAGE_PATH)
+        url = cfg["billing_upstream"] + path
         headers = self.headers(purpose="billing")
         headers["X-Client-Platform"] = "web"
         try:
@@ -2532,6 +2974,93 @@ class Account(object):
             self.save(os.path.dirname(self.path))
         return {"ok": True, "credits": self.credits}
 
+    def tier_paid(self):
+        """True / False once the billing summary has answered, None when unknown.
+
+        `None` is not "free": a summary that failed or never ran must not
+        quietly withhold PRO models from a paying account. Callers fall back to
+        the last credits snapshot instead (see __init__).
+        """
+        tier = self.tier if isinstance(self.tier, dict) else None
+        if not tier:
+            return None
+        paid = tier.get("paid")
+        return bool(paid) if paid is not None else None
+
+    def tier_is_fresh(self, now=None):
+        """True while the stored tier is inside TIER_TTL_SECONDS."""
+        tier = self.tier if isinstance(self.tier, dict) else None
+        if not tier or tier.get("paid") is None:
+            return False
+        try:
+            checked = float(tier.get("checked_at") or 0)
+        except (TypeError, ValueError):
+            return False
+        now = time.time() if now is None else now
+        # `0 < delta` 会漏掉「刚读完」那一瞬间：同一毫秒内 delta 就是 0.0，
+        # 于是第二次调用又去请求一次。只要求时间戳有效、且没超过 TTL。
+        return checked > 0 and (now - checked) < TIER_TTL_SECONDS
+
+    def apply_tier(self, info):
+        """Record a billing-summary answer and mirror it into the credits view.
+
+        The panel reads `credits.is_paid_user`; keeping the two in step is what
+        makes the badge and the model gate agree. A partial answer is ignored
+        rather than stored, so a malformed response cannot erase a known tier.
+        """
+        if not isinstance(info, dict) or info.get("paid") is None:
+            return False
+        self.tier = dict(info)
+        self.is_paid_user = bool(info.get("paid"))
+        if isinstance(self.credits, dict):
+            self.credits["is_paid_user"] = self.is_paid_user
+        return True
+
+    def _fetch_tier_summary(self, headers=None):
+        """Read the tier from the billing summary (#505).
+
+        CN's detailed balance path already calls this endpoint, so it hands the
+        parsed answer to apply_tier() instead of paying for a second request.
+        The intl balance path (`get-user-resource`) carries neither
+        `IsPaidUser` nor `SubscriptionPackageName`, so there this is one extra
+        request per TIER_TTL_SECONDS.
+
+        Returns None on any failure. "No answer" must never become a tier
+        conclusion: 401 / non-zero code / network error leaves the previous
+        value and its timestamp exactly as they were.
+        """
+        if self.uses_enterprise_billing():
+            # 企业空间的 IsPaidUser 语义未验证（#505），先按「未知」处理。
+            # 静态 Key 的个人计费摘要端点直接 401，同样按未知处理。
+            return None
+        if self.restricted_until > time.time():
+            # 账号正被上游限制：这时再打计费接口只会继续喂风控。
+            return None
+        if headers is None:
+            headers = self.headers(purpose="billing")
+        headers = dict(headers)
+        headers["X-Client-Platform"] = "web"
+        url = get_realm_config(self.realm)["billing_upstream"] + RESOURCE_SUMMARY_PATH
+        try:
+            res = http_json(url, data=b"{}", method="POST", headers=headers,
+                            timeout=15, proxy=self.proxy)
+        except Exception:
+            return None
+        if not isinstance(res, dict) or res.get("code") != 0:
+            return None
+        return tier_from_summary(res.get("data"))
+
+    def _refresh_tier_if_due(self):
+        """Refresh the tier at most once per TIER_TTL_SECONDS."""
+        if self.tier_is_fresh():
+            return None
+        info = self._fetch_tier_summary()
+        if not info or not self.apply_tier(info):
+            return None
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            self.save(os.path.dirname(self.path))
+        return info
+
     def fetch_credits(self):
         """Refresh the balance; a refresh that shows credits again also lifts
         an early 402 park (revive_balance_cooldown).
@@ -2545,9 +3074,23 @@ class Account(object):
             res = self._fetch_credits_raw()
             if isinstance(res, dict) and res.get("ok"):
                 self.revive_balance_cooldown()
+                # 档位跟着积分刷新走（#505）：同一处节流、同一个后台循环，
+                # 不新开定时器；失败不写结论，旧值和时间戳原样保留。
+                tier = self._refresh_tier_if_due()
+                if tier:
+                    res = dict(res)
+                    res["tier"] = tier
             return res
 
     def _fetch_credits_raw(self):
+        # 静态 API Key 没有套餐概览/个人资源包：/billing/meter/get-user-resource-summary
+        # 对它直接 401（实测，APISIX 层挡掉），个人 get-user-resource 返回空
+        # Accounts。所以不进个人链路，直接问企业口径。
+        if self.is_api_key:
+            ent = self._fetch_credits_enterprise()
+            if ent.get("ok"):
+                return ent
+            return ent
         if self.realm == "cn":
             try:
                 res = self._fetch_credits_cn_detailed()
@@ -3090,6 +3633,12 @@ class CreditsRefresher(threading.Thread):
             self.last_error = None
             self.log("已刷新 %s 的积分（%s）"
                      % (account.uid[:8], (account.credits or {}).get("updated_iso")))
+            tier = result.get("tier") if isinstance(result, dict) else None
+            if isinstance(tier, dict):
+                self.log("已读取 %s 的账号档位：%s%s"
+                         % (account.uid[:8],
+                            "付费" if tier.get("paid") else "免费",
+                            (" · " + tier["package"]) if tier.get("package") else ""))
             return account.uid
 
     def run(self):
@@ -3211,6 +3760,9 @@ class AccountPool(object):
                 account.path = existing.path
                 if not account.credits and existing.credits:
                     account.credits = existing.credits
+                # 重新登录 / 扫码换 token 不该丢掉已经读到的档位（#505）。
+                if not account.tier and existing.tier:
+                    account.apply_tier(existing.tier)
                 if not account.last_checkin and existing.last_checkin:
                     account.last_checkin = existing.last_checkin
                 if not account.last_daily_chat and existing.last_daily_chat:
@@ -4275,7 +4827,7 @@ EXPORT_VERSION = 1
 # exported for inspection but never trusted on import: a stale cooldown or a
 # disabled flag from another machine would silently cripple the target pool.
 VOLATILE_FIELDS = ("cooldownUntil", "lastError", "credits", "lastCheckin",
-                   "lastDailyChat", "lastActivityReport", "modelCaps")
+                   "lastDailyChat", "lastActivityReport", "modelCaps", "tier")
 
 # The subset of VOLATILE_FIELDS that must not round-trip through the local
 # credential file at all: they are not trusted on load and not written by save(),
@@ -4397,7 +4949,10 @@ def normalise_import_row(row, realm=None):
     token = str(pick("accessToken") or "").strip()
     if not token:
         raise ValueError("no accessToken")
-    if token.count(".") != 2:
+    api_key = is_api_key_token(token)
+    # 静态 API Key 不是 JWT，不能按 JWT 校验；其余形态仍要求三段式，
+    # 那是「这串东西确实是 OAuth token」唯一可靠的本地判据。
+    if not api_key and token.count(".") != 2:
         raise ValueError("accessToken is not a JWT")
 
     # Where the account belongs. A realm forced by the caller still wins (that
@@ -4406,6 +4961,10 @@ def normalise_import_row(row, realm=None):
     # then exported again) must not keep dragging itself back there, and the
     # wrong region sends every request to the wrong upstream.
     forced = str(realm or "").strip().lower()
+    if api_key:
+        # 静态 Key 只在国内版出口有效。强制成 cn，忽略调用方的 realm 参数与
+        # 行里的旧值——把这类账号放进国际版列表，每个请求都会打空。
+        forced = "cn"
     evidence = realm_evidence(token, pick("domain"))
     row_realm = str(pick("realm") or "").strip().lower()
     if forced in ("intl", "cn"):
@@ -4419,6 +4978,10 @@ def normalise_import_row(row, realm=None):
     cfg = get_realm_config(detected)
 
     raw_uid = str(pick("uid") or "").strip() or jwt_uid(token)
+    if not raw_uid and api_key:
+        # 静态 Key 从自己的 <id> 段派生 uid：ck_<id>.<secret> → apikey-<id>。
+        # 与 Go 版面板同一口径，两边导出的文件可以互认。
+        raw_uid = "apikey-" + api_key_id(token)
     uid = re.sub(r"[^A-Za-z0-9_-]", "_", raw_uid).strip("_ ")
     if not uid:
         raise ValueError("cannot determine uid (no uid field and no sub claim)")
@@ -4433,8 +4996,9 @@ def normalise_import_row(row, realm=None):
         "enterpriseId": str(pick("enterpriseId") or ""),
         "accessToken": token,
         "refreshToken": str(pick("refreshToken") or ""),
-        "expiresAt": normalize_epoch(pick("expiresAt")) or jwt_exp(token),
-        "source": str(pick("source") or "import"),
+        "expiresAt": (0 if api_key
+                      else normalize_epoch(pick("expiresAt")) or jwt_exp(token)),
+        "source": str(pick("source") or (SOURCE_API_KEY if api_key else "import")),
         "enabled": True,
         # Imported accounts start with tasks on (they are new to this pool);
         # an export that carries the flag keeps the operator's choice.

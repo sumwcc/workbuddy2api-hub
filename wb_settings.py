@@ -48,6 +48,14 @@ CREDITS_REFRESH_HOURS_KEY = "credits_refresh_hours"
 SECTION_MAX_HEIGHT_KEY = "section_max_height"
 DEFAULT_SECTION_MAX_HEIGHT = 640
 MAX_SECTION_MAX_HEIGHT = 4000
+# How many app-layer backups a successful update keeps under <app>/updates.
+# Rollback works off those backups, so 0 means "no rollback at all"; 1 is the
+# default because it is enough to undo one step and each backup is a few MB.
+# Capped at 3: the app layer is ~5 MB per copy and the container's rootfs is
+# small, so an unbounded value is a foot-gun rather than a feature.
+KEEP_BACKUPS_KEY = "keep_backups"
+DEFAULT_KEEP_BACKUPS = 1
+MAX_KEEP_BACKUPS = 3
 # Whether a model name may inherit its price from a suffix-stripped base
 # (deepseek-r1-0528-lkeap → deepseek-r1-0528). Missing key reads as on.
 PRICING_VARIANT_INHERIT_KEY = "pricing_variant_inherit"
@@ -103,6 +111,9 @@ UPDATE_CHECK_ENABLED_KEY = "update_check_enabled"
 # The last-check bookkeeping for that daily check. One small object, never a
 # general update-state store: see update_check_state().
 UPDATE_CHECK_STATE_KEY = "update_check"
+# How many startup-check timestamps that object keeps. Enough to count an hour
+# of restarts, and a hard cap so the file cannot grow with uptime.
+STARTUP_CHECK_STAMPS_KEPT = 12
 
 # 剩余用量优先调度：把「估计剩余快耗尽」的 (账号, 模型) 先交出去（剩余越少
 # 权重越高）。缺失键读作关：估算本身是从撞线样本反推的，优先它是一次刻意的
@@ -113,6 +124,88 @@ REMAINING_PRIORITY_ENABLED_KEY = "remaining_priority_enabled"
 # 计数，改记在出口上、退避降到秒级（见 wb_egress）。缺失键读作关：它改变的是
 # 派发路径上的失败归账与退避尺度，老安装保持原样（传输错误仍喂账号熔断）。
 EGRESS_BACKOFF_ENABLED_KEY = "egress_backoff_enabled"
+
+# 跨出口回退（国际版 → 国内版）：国际版出口把某个模型限流 / 当日额度用满 /
+# 整池冷却时，允许拿同名的国内版出口再试一次。缺失键读作关 —— 两个出口是两套
+# 上游、两套额度、两套积分口径，混用会让「这个 Key 只花国际额度」的部署失去
+# 保证，所以老安装保持出口严格隔离（realm 一次定死，账号池按 realm 过滤）。
+# 打开后方向仍是单向的：只有 intl → cn，永远不会把请求从国内版打到国际版。
+REALM_FALLBACK_ENABLED_KEY = "realm_fallback_enabled"
+
+# 账号级并发上限：同一个上游账号同时最多跑几个 chat 请求。缺失键读作 0（不限），
+# 老安装的派发行为与上游一字不差。
+#
+# 为什么需要它：上游按「账号 + 分钟」计 token（TPM），而一个大上下文会话单请求
+# 就带十几万 token。两个会话同时落在一个账号上，一分钟内轻松过百万 token，上游
+# 直接回 429；网关随即把该账号停放 60 秒并换号，新账号没有这段对话的前缀缓存，
+# 缓存命中率从 99% 掉到 0、TTFT 从 1.5s 涨到 5-6s。也就是说「并发越高」反而让
+# 每个请求更慢。设成 1 时两个会话自然分到两个账号，各走各的缓存。
+ACCOUNT_MAX_CONCURRENT_KEY = "account_max_concurrent"
+#: 上限值域：0 = 不限；1..10 是「每账号同时几个」。10 只是防手滑的上界。
+ACCOUNT_MAX_CONCURRENT_MAX = 10
+
+
+def account_max_concurrent(accounts_dir):
+    """How many chat requests one upstream account may run at once.
+
+    0 (the default) means unlimited: dispatch behaves exactly as upstream does.
+    Anything unreadable falls back to 0 rather than to a limit, so a hand-edited
+    settings.json can never silently throttle a working install.
+    """
+    value = load(accounts_dir).get(ACCOUNT_MAX_CONCURRENT_KEY)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    if value < 0 or value > ACCOUNT_MAX_CONCURRENT_MAX:
+        return 0
+    return value
+
+
+def set_account_max_concurrent(accounts_dir, value):
+    """Persist the per-account concurrency cap. Returns the stored whole number."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("account_max_concurrent must be a whole number")
+    if value < 0:
+        raise ValueError("account_max_concurrent cannot be less than 0")
+    if value > ACCOUNT_MAX_CONCURRENT_MAX:
+        raise ValueError("account_max_concurrent cannot be more than %d"
+                         % ACCOUNT_MAX_CONCURRENT_MAX)
+    with _lock:
+        data = load(accounts_dir)
+        data[ACCOUNT_MAX_CONCURRENT_KEY] = value
+        save(accounts_dir, data)
+    return value
+
+# 更稳的会话粘滞键：把「首条 assistant 回复 + 它后面那条 user」也算进会话键。
+#
+# 为什么需要：会话键原本只用【system + 首条 user】，两个开场白相同的会话会算出
+# 同一个键、共享同一个绑定槽，于是每轮互相覆盖、轮流换账号，缓存每轮归零
+# （见 affinity_route）。把第 2 轮才出现的内容算进去之后，两个会话从第 2 轮起
+# 各走各的账号；前缀真的完全相同的会话仍会共用账号——那本来就是最优的缓存共享。
+#
+# 默认关：改的是派发路径上的会话识别，老安装必须保持原逻辑。关着时
+# affinity_route 与上游一字不差，可随时回退。
+AFFINITY_STABLE_KEY_ENABLED_KEY = "affinity_stable_key_enabled"
+
+
+def affinity_stable_key_enabled(accounts_dir):
+    """Whether the conversation key also covers the first assistant turn."""
+    return load(accounts_dir).get(AFFINITY_STABLE_KEY_ENABLED_KEY) is True
+
+
+def set_affinity_stable_key_enabled(accounts_dir, enabled):
+    """Persist the stable-affinity-key switch. Returns the stored boolean.
+
+    Strict on purpose: ``bool("false")`` is True, so a string that slipped in
+    from a caller would silently turn the new key on. The HTTP layer already
+    rejects non-booleans; this keeps every other caller honest too.
+    """
+    if not isinstance(enabled, bool):
+        raise ValueError("affinity_stable_key_enabled must be true or false")
+    with _lock:
+        data = load(accounts_dir)
+        data[AFFINITY_STABLE_KEY_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
 
 # 日志落库：把运行日志追加写进 usage/logs.sqlite3，重启后仍能回看，方便事后
 # debug。缺失键读作关 —— 关着的时候日志只留在内存环形缓冲里，与上游一字不差；
@@ -966,6 +1059,39 @@ def set_credits_refresh_hours(accounts_dir, value):
     return hours
 
 
+def keep_backups(accounts_dir):
+    """How many update backups to retain, 0-3.
+
+    Read by the update path after every success (prune) and by the panel before
+    it offers a rollback, so a missing or hand-edited value must never be
+    something the callers have to guard: anything that is not an int reads as
+    the default, and the result is always inside 0..MAX_KEEP_BACKUPS.
+    """
+    with _lock:
+        raw = load(accounts_dir).get(KEEP_BACKUPS_KEY)
+    if raw is None or isinstance(raw, bool):
+        return DEFAULT_KEEP_BACKUPS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_KEEP_BACKUPS
+    return max(0, min(MAX_KEEP_BACKUPS, value))
+
+
+def set_keep_backups(accounts_dir, value):
+    """Persist the backup retention count. Returns the stored value."""
+    try:
+        keep = int(value)
+    except (TypeError, ValueError):
+        keep = DEFAULT_KEEP_BACKUPS
+    keep = max(0, min(MAX_KEEP_BACKUPS, keep))
+    with _lock:
+        data = load(accounts_dir)
+        data[KEEP_BACKUPS_KEY] = keep
+        save(accounts_dir, data)
+    return keep
+
+
 #: 后台排程时段（CST 24 小时制）。默认值与旧版硬编码完全一致，老安装行为不变。
 DEFAULT_SCHEDULE_HOURS = {
     "checkin": [9, 21],
@@ -1167,6 +1293,40 @@ def set_section_max_height(accounts_dir, value):
 # 退回完整目录；显式保存空列表表示「用户全部取消」，一键配置会拒绝写空清单
 # ——空清单会生成一个没有模型的 provider，客户端直接不可用。
 AGENT_MODELS_KEY = "agent_models"
+MODEL_ALIASES_KEY = "model_aliases"
+
+
+def _clean_model_aliases(raw):
+    """Normalise an alias table to ``{lowercase alias: target}``.
+
+    ``model_aliases`` predates the current tree and appears in existing
+    settings files as a plain object.  Accept that shape plus the common
+    ``[{"from": ..., "to": ...}]`` spelling, but never let a malformed entry
+    turn a request into a 500: unknown shapes are ignored.
+    """
+    out = {}
+    pairs = []
+    if isinstance(raw, dict):
+        pairs = list(raw.items())
+    elif isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            source = item.get("from") or item.get("alias") or item.get("name")
+            target = item.get("to") or item.get("target") or item.get("model")
+            pairs.append((source, target))
+    for source, target in pairs:
+        alias = str(source or "").strip().lower()
+        model = str(target or "").strip()
+        if alias and model and alias != model.lower():
+            out[alias] = model
+    return out
+
+
+def model_aliases(accounts_dir):
+    """Read the operator-maintained model alias table."""
+    raw = load(accounts_dir).get(MODEL_ALIASES_KEY)
+    return _clean_model_aliases(raw)
 # 清单写进客户端配置后会被逐条展开；200 条已远超任何出口的模型数，上限只挡
 # 手编 settings.json 把客户端配置撑爆。
 MAX_AGENT_MODELS = 200
@@ -1818,6 +1978,40 @@ def set_egress_backoff_enabled(accounts_dir, enabled):
     return enabled
 
 
+def realm_fallback_enabled(accounts_dir):
+    """Whether a throttled international exit may fail over to the domestic one.
+
+    Off unless the operator turns it on, because it crosses a boundary the
+    gateway otherwise keeps absolute: an account belongs to one exit, and the
+    pool only ever dispatches that exit's accounts (see AccountPool.pick). The
+    two exits are separate upstreams with separate quota and separate credit
+    ledgers, so serving a request from the other one changes which balance was
+    spent.
+
+    It is still worth having: the exits throttle independently. When every
+    international account is cooling a model - upstream frequency limit, a used
+    up 24h window, or the gateway's own synthesized "usage exceeds frequency
+    limit" - the domestic exit can usually serve the same model right away,
+    because it is a different host with its own rate limiter.
+
+    The direction is deliberately one-way (intl -> cn). A request that started
+    on the domestic exit never fails over to the international one: domestic
+    accounts are the cheaper/free side, and silently moving traffic onto the
+    international exit would spend a balance the operator did not ask to spend.
+    """
+    return load(accounts_dir).get(REALM_FALLBACK_ENABLED_KEY) is True
+
+
+def set_realm_fallback_enabled(accounts_dir, enabled):
+    """Persist the cross-exit fallback switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[REALM_FALLBACK_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
 def log_db_enabled(accounts_dir):
     """Whether runtime logs are also appended to usage/logs.sqlite3.
 
@@ -2100,6 +2294,49 @@ def set_daily_chat_web_timeout(accounts_dir, seconds):
     with _lock:
         data = load(accounts_dir)
         data["daily_chat_web_timeout"] = seconds
+        save(accounts_dir, data)
+    return seconds
+
+
+#: 「还没跑到 turn 就失败」（建会话 5xx、取沙箱失败）时的退避基数上限（秒）。
+#: 那一轮只花掉几百毫秒、不消耗任何等待预算，所以退避是唯一的节奏；但它同样
+#: 有上限——一个卡住的上游会让每个候选都睡这么久。
+DAILY_CHAT_WEB_RETRY_BACKOFF_MAX = 60
+#: 没配过时的退避基数（秒）。调用方另有内置默认（wb_accounts.WEB_RETRY_BACKOFF，
+#: 吃 WB_WEB_RETRY_BACKOFF 环境变量）时会把自己的默认传进来。
+DAILY_CHAT_WEB_RETRY_BACKOFF_DEFAULT = 5
+
+
+def daily_chat_web_retry_backoff(accounts_dir, default=None):
+    """Seconds to wait before retrying a round that never reached the turn.
+
+    0 disables the backoff, which is the pre-1.7.x timing (retry immediately).
+    ``default`` is what an unset install gets, so a caller that has its own
+    built-in default (the env-overridable ``WB_WEB_RETRY_BACKOFF``) keeps it.
+    Anything that is not a whole number in range also falls back to it.
+    """
+    if default is None:
+        default = DAILY_CHAT_WEB_RETRY_BACKOFF_DEFAULT
+    value = load(accounts_dir).get("daily_chat_web_retry_backoff")
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or value < 0 or value > DAILY_CHAT_WEB_RETRY_BACKOFF_MAX):
+        return default
+    return value
+
+
+def set_daily_chat_web_retry_backoff(accounts_dir, seconds):
+    """Persist the backoff base. Returns the stored whole number of seconds."""
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise ValueError(
+            "daily_chat_web_retry_backoff must be a whole number of seconds")
+    if seconds < 0:
+        raise ValueError("daily_chat_web_retry_backoff cannot be negative")
+    if seconds > DAILY_CHAT_WEB_RETRY_BACKOFF_MAX:
+        raise ValueError("daily_chat_web_retry_backoff cannot be more than %d"
+                         % DAILY_CHAT_WEB_RETRY_BACKOFF_MAX)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_chat_web_retry_backoff"] = seconds
         save(accounts_dir, data)
     return seconds
 
@@ -2456,14 +2693,17 @@ def set_window_probe(accounts_dir, enabled):
 def update_check_state(accounts_dir):
     """The last-check bookkeeping: when it ran, and the version it saw.
 
-    Deliberately three fields. The 24h cadence needs `last_attempt` to survive a
-    restart, and `latest_version` is what lets the panel answer right after one;
-    everything else about a check lives in memory. Nothing from the HTTP
-    exchange - URL, headers, body - is ever stored here.
+    Three fields plus one bounded list. The 24h cadence needs `last_attempt` to
+    survive a restart, and `latest_version` is what lets the panel answer right
+    after one; `startup_checks` holds the timestamps of the last few
+    startup-time checks so the budget in wb_updates can be counted across
+    restarts. Everything else about a check lives in memory, and nothing from
+    the HTTP exchange - URL, headers, body - is ever stored here.
     """
     stored = load(accounts_dir).get(UPDATE_CHECK_STATE_KEY)
     stored = stored if isinstance(stored, dict) else {}
-    out = {"last_attempt": 0.0, "last_success": 0.0, "latest_version": ""}
+    out = {"last_attempt": 0.0, "last_success": 0.0, "latest_version": "",
+           "startup_checks": []}
     for key in ("last_attempt", "last_success"):
         value = stored.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
@@ -2471,7 +2711,37 @@ def update_check_state(accounts_dir):
     version = stored.get("latest_version")
     if isinstance(version, str):
         out["latest_version"] = version.strip()[:32]
+    stamps = stored.get("startup_checks")
+    if isinstance(stamps, list):
+        kept = [float(item) for item in stamps
+                if isinstance(item, (int, float)) and not isinstance(item, bool)
+                and item > 0]
+        out["startup_checks"] = sorted(kept)[-STARTUP_CHECK_STAMPS_KEPT:]
     return out
+
+
+def record_startup_check(accounts_dir, at=None):
+    """Append one startup-time check to the budget ledger. Returns the state.
+
+    A separate write path from record_update_check() on purpose: that one keeps
+    "last attempt / last success / version seen", while the budget needs "when
+    did the last few startup passes happen". Folding the two together would make
+    `last_attempt` mean two different things and leave the cadence unreadable.
+    """
+    stamp = float(at if at is not None else time.time())
+    with _lock:
+        data = load(accounts_dir)
+        state = data.get(UPDATE_CHECK_STATE_KEY)
+        state = dict(state) if isinstance(state, dict) else {}
+        stamps = state.get("startup_checks")
+        kept = [float(item) for item in stamps
+                if isinstance(item, (int, float)) and not isinstance(item, bool)
+                and item > 0] if isinstance(stamps, list) else []
+        kept.append(stamp)
+        state["startup_checks"] = sorted(kept)[-STARTUP_CHECK_STAMPS_KEPT:]
+        data[UPDATE_CHECK_STATE_KEY] = state
+        save(accounts_dir, data)
+    return update_check_state(accounts_dir)
 
 
 def record_update_check(accounts_dir, at=None, success=False, latest_version=""):
