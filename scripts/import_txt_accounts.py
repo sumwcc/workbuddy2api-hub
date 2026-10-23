@@ -25,14 +25,85 @@ def decode_jwt_payload(token):
         print(f"[!] JWT payload decode error: {exc}", file=sys.stderr)
         return {}
 
-def parse_txt_files(file_paths):
+def parse_json_file(fp):
+    try:
+        with open(fp, "r", encoding="utf-8", errors="ignore") as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        print(f"[!] JSON 解析失败 ({fp}): {exc}", file=sys.stderr)
+        return []
+
+    raw_items = []
+    if isinstance(data, list):
+        raw_items = data
+    elif isinstance(data, dict):
+        if isinstance(data.get("accounts"), list):
+            raw_items = data["accounts"]
+        else:
+            raw_items = [data]
+
+    parsed = []
+    fallback_name = os.path.splitext(os.path.basename(fp))[0]
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        acc = item.get("account") if isinstance(item.get("account"), dict) else item
+        auth = item.get("auth") if isinstance(item.get("auth"), dict) else item
+        access_token = (auth.get("accessToken") or item.get("accessToken") or "").strip()
+        refresh_token = (auth.get("refreshToken") or item.get("refreshToken") or "").strip()
+        if not access_token:
+            print(f"[!] JSON 缺少 accessToken: {fp}", file=sys.stderr)
+            continue
+        jwt_payload = decode_jwt_payload(access_token)
+        uid = (acc.get("uid") or item.get("uid") or jwt_payload.get("sub") or "").strip()
+        if not uid:
+            print(f"[!] 无法从 JSON 或 Token 中解析出 uid: {fp}", file=sys.stderr)
+            continue
+        nickname = (
+            acc.get("nickname")
+            or item.get("nickname")
+            or jwt_payload.get("preferred_username")
+            or fallback_name
+        )
+        exp = auth.get("expiresAt") or item.get("expiresAt") or jwt_payload.get("exp")
+        domain = (auth.get("domain") or item.get("domain") or "").strip() or "copilot.tencent.com"
+        realm = (auth.get("realm") or item.get("realm") or "").strip() or "cn"
+        enterprise_id = (acc.get("enterpriseId") or item.get("enterpriseId") or "").strip()
+
+        account_item = {
+            "uid": uid,
+            "nickname": str(nickname).strip(),
+            "domain": domain,
+            "realm": realm,
+            "platform": item.get("platform") or "CLI",
+            "product": item.get("product") or "workbuddy",
+            "enterpriseId": enterprise_id,
+            "accessToken": access_token,
+            "refreshToken": refresh_token,
+            "expiresAt": exp,
+            "enabled": True,
+            "source": "import",
+        }
+        parsed.append(account_item)
+        print(f"[+] 成功解析 JSON 账号: {account_item['nickname']} (UID: {uid}, 过期时间: {exp})")
+    return parsed
+
+
+def parse_account_files(file_paths):
     accounts = []
     for fp in file_paths:
         if not os.path.exists(fp):
             print(f"[!] 文件不存在: {fp}", file=sys.stderr)
             continue
+        if fp.lower().endswith(".json"):
+            accounts.extend(parse_json_file(fp))
+            continue
         with open(fp, "r", encoding="utf-8", errors="ignore") as fh:
             content = fh.read().strip()
+        # 若 txt 内实际是 JSON 内容，也自动按 JSON 解析
+        if content.startswith("{") or content.startswith("["):
+            accounts.extend(parse_json_file(fp))
+            continue
         parts = content.split("----")
         if len(parts) < 3:
             print(f"[!] 文件格式不符合 手机号----AT----RT: {fp}", file=sys.stderr)
@@ -63,7 +134,7 @@ def parse_txt_files(file_paths):
             "source": "import"
         }
         accounts.append(account_item)
-        print(f"[+] 成功解析账号: {phone} (UID: {uid}, 过期时间: {exp})")
+        print(f"[+] 成功解析 TXT 账号: {phone} (UID: {uid}, 过期时间: {exp})")
     return accounts
 
 def deploy_to_server(accounts, server_host="34.96.166.42", server_user="mwsu"):
@@ -128,14 +199,16 @@ def main():
     parser.add_argument("--report", default="", help="解析结果 JSON 报告路径（不含 token）")
     args = parser.parse_args()
 
-    file_paths = sorted(glob.glob(os.path.join(args.dir, "*.txt")))
+    txt_paths = sorted(glob.glob(os.path.join(args.dir, "*.txt")))
+    json_paths = sorted(glob.glob(os.path.join(args.dir, "*.json")))
+    file_paths = txt_paths + json_paths
     if not file_paths:
-        print(f"[!] 目录中没有 txt 文件: {args.dir}", file=sys.stderr)
+        print(f"[!] 目录中没有 txt 或 json 文件: {args.dir}", file=sys.stderr)
         sys.exit(1)
 
     print(f"[*] 目录: {args.dir}")
-    print(f"[*] 发现 {len(file_paths)} 个 txt 文件")
-    accounts = parse_txt_files(file_paths)
+    print(f"[*] 发现 {len(file_paths)} 个账号文件 (txt: {len(txt_paths)}, json: {len(json_paths)})")
+    accounts = parse_account_files(file_paths)
     if not accounts:
         print("[!] 没有有效账号可导入，退出。")
         sys.exit(1)
