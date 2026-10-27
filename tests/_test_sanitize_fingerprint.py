@@ -297,6 +297,11 @@ class IdentityVerbVariantsTests(unittest.TestCase):
         ):
             self.assertEqual(P.sanitize_text(sentence), sentence, sentence)
 
+    def test_dsh_paths_fingerprint_rewritten(self):
+        text = "Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host."
+        expected = "Tokens prefixed with @ are paths that the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host."
+        self.assertEqual(P.sanitize_text(text), expected)
+
     def test_variants_scoped_to_system_and_developer(self):
         fp = "You are Example Agent, built by Example Corp."
         out = P.sanitize_messages([

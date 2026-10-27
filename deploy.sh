@@ -64,7 +64,7 @@ rsync -avz \
 
 # 2. 通过 SSH 平滑热重启 PM2 托管的 wb-proxy 服务
 echo "⚡ 连接远程执行 PM2 平滑重载..."
-ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_IP} "pm2 reload wb-proxy && pm2 status wb-proxy"
+ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_IP} "pm2 reload wb-proxy --update-env && pm2 status wb-proxy"
 
 # 3. 校验健康状态
 echo "🔍 验证远程网关健康状态..."
