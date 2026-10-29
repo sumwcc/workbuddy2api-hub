@@ -10343,7 +10343,7 @@ def affinity_route(messages):
             # 不同的地方，又只占一轮的 token，哈希开销可忽略。system 提示相同
             # 时它同样稳定（同一会话每轮都能算出同一个键）。
             head = msgs[:3]
-        blob = json.dumps(head, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        blob = json.dumps(head, ensure_ascii=False, sort_keys=True).encode("utf-8", "backslashreplace")
         digest = hashlib.sha256(blob).hexdigest()[:16]
         key = "pfx-" + digest
         if AFFINITY_MAX_MSGS > 0 and len(msgs) > AFFINITY_MAX_MSGS:
@@ -10373,7 +10373,7 @@ def prompt_fingerprint(messages):
     """
     try:
         def h(obj):
-            blob = json.dumps(obj, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            blob = json.dumps(obj, ensure_ascii=False, sort_keys=True).encode("utf-8", "backslashreplace")
             return hashlib.sha256(blob).hexdigest()[:12]
         msgs = messages or []
         out = {"msgs_sha": h(msgs), "n_msgs": len(msgs)}
@@ -12956,7 +12956,7 @@ def chat_stream_error_frame(message, code="upstream_stream_error"):
     """
     payload = {"error": {"message": str(message), "type": "upstream_error",
                          "param": None, "code": code}}
-    return ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8")
+    return ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8", "backslashreplace")
 
 
 def responses_stream_error_frame(message, code="upstream_stream_error"):
@@ -12964,7 +12964,7 @@ def responses_stream_error_frame(message, code="upstream_stream_error"):
     payload = {"type": "error", "code": code, "message": str(message),
                "param": None, "sequence_number": 0}
     return ("event: error\ndata: " + json.dumps(payload, ensure_ascii=False)
-            + "\n\n").encode("utf-8")
+            + "\n\n").encode("utf-8", "backslashreplace")
 
 
 def translate_max_completion_tokens(obj):
@@ -13380,9 +13380,15 @@ def encode_upstream_body(body):
     separators=(", ", ": ") 会多出空格，body 字节与 Content-Length 都成一处机器
     特征（上游解析结果等价，只影响线上字节）。单独成函数，让「出站 chat body
     用紧凑 JSON」有唯一入口、可被测试钉住。
+
+    出站编码统一使用 backslashreplace：
+    当客户端 prompt 包含截断或未配对的 UTF-16 代理字符（如 \\ud83d）时，常规 encode("utf-8")
+    会抛出 surrogates not allowed 导致 502 报错。
+    使用 backslashreplace 能将孤立代理安全转回合法 JSON 字符串格式（\\ud83d），同时
+    所有合法中文、Emoji 和 ASCII 依然保留为原生 UTF-8 字节。
     """
     return json.dumps(body, ensure_ascii=False,
-                      separators=(",", ":")).encode("utf-8")
+                      separators=(",", ":")).encode("utf-8", "backslashreplace")
 
 
 def model_catalog_meta(model):
@@ -18234,7 +18240,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         log(fmt % args)
     def _json(self, code, obj):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8", "backslashreplace")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
