@@ -11816,15 +11816,6 @@ SANITIZE_KV_RE = re.compile(r"(?i)\bcc_[a-z0-9_]+=[^;\r\n]*;?\s*")
 SANITIZE_OMO_JUNIOR_RE = re.compile(
     r"Sisyphus-Junior - Focused executor from OhMyOpenCode", re.IGNORECASE
 )
-# DeepSeek Harness (dsh) / Agent 工作区路径提示指纹：
-#   Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root...
-# 上游 WAF 针对连续子串做命中拦截，直接返回 400 / code 11128。微调插入 that 破坏连续字面量，
-# 语义对 Agent 完全保持一致，彻底消除 WAF 拦截。
-SANITIZE_DSH_PATHS_RE = re.compile(
-    r"Tokens prefixed with @ are paths the user explicitly referenced\.", re.IGNORECASE
-)
-SANITIZE_DSH_PATHS_REPLACEMENT = "Tokens prefixed with @ are paths that the user explicitly referenced."
-SANITIZE_DSH_PATHS_LOWER = "tokens prefixed with @"
 # 上游 WAF 把「客户端自我介绍句式 + 品牌」当成非官方渠道（#533 / #537 / #539）：
 #   You are an AI agent powered by DeepSeek Harness.
 #   You are a coding agent powered by the deepseek-v4.1-flash model.
@@ -11927,8 +11918,7 @@ def has_fingerprint(text, identity=True):
     else:
         low = text.lower()
     if (SANITIZE_BARE_HDR_LOWER in low
-            or SANITIZE_OMO_JUNIOR_LOWER in low
-            or SANITIZE_DSH_PATHS_LOWER in low):
+            or SANITIZE_OMO_JUNIOR_LOWER in low):
         return True
     if not identity:
         return False
@@ -11960,7 +11950,6 @@ def sanitize_text(text, identity=True):
     # accepted by the upstream. Only the confirmed contiguous fingerprint is
     # neutralized.
     text = SANITIZE_OMO_JUNIOR_RE.sub("Sisyphus-Junior - Focused executor", text)
-    text = SANITIZE_DSH_PATHS_RE.sub(SANITIZE_DSH_PATHS_REPLACEMENT, text)
     if identity:
         text = SANITIZE_IDENTITY_RE.sub(SANITIZE_IDENTITY_REPLACEMENT, text)
         # GUI 描述段单独一条规则：锚定整句，只调整句尾语序。
