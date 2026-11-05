@@ -37,11 +37,10 @@ git push origin dev
 
 ### 现役服务器（两台）
 
-| 节点 | IP | 用户 | 远程目录 | 状态 |
-|---|---|---|---|---|
-| Node 1（香港-CN2 主节点） | `82.158.229.151` | `mwsu` | `/home/mwsu/workbuddy2api-hub` | 在用 |
-| Node 2（香港-CN2 从节点） | `45.207.212.73` | `mwsu` | `/home/mwsu/workbuddy2api-hub` | 在用 |
-| GCP 辅助节点 | `34.96.166.42` | `mwsu` | 同上 | **已归档下线**，账号与号池已并入 CN2，不要再往它发 |
+| 节点 | IP | 用户 | 远程目录 |
+|---|---|---|---|
+| Node 1（香港-CN2 主节点） | `82.158.229.151` | `mwsu` | `/home/mwsu/workbuddy2api-hub` |
+| Node 2（香港-CN2 从节点） | `45.207.212.73` | `mwsu` | `/home/mwsu/workbuddy2api-hub` |
 
 ### 发布架构：PM2 蓝绿双槽位 + Nginx 切流（零停机）
 
@@ -60,7 +59,7 @@ git push origin dev
 ./deploy.sh -t <IP>       # 任意目标
 ```
 
-`-t gcp` 会直接报错退出并提示改用 `-t node2`。等价底层命令：`bash ../new-api-cf/scripts/local_deploy_hub.sh --ip 82.158.229.151`。
+`-t` 只认 `cn2` / `node2` / 字面 IP。等价底层命令：`bash ../new-api-cf/scripts/local_deploy_hub.sh --ip 82.158.229.151`。
 
 ### 部署关键约束
 1. **严格排除账号与用量敏感数据**：同步时绝不可覆盖服务器上的 `accounts/`（含 `accounts/*.json`、`accounts/settings.json`、`accounts/active_realm.json`、`accounts/model.json`、`accounts/codearts/`、`accounts/agent-backups/`）、`usage/`、`logs/`，防止账号凭据或调用统计丢失。

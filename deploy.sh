@@ -3,8 +3,8 @@
 # workbuddy2api-hub 一键发布入口（本地 -> 香港服务器，PM2 蓝绿零停机）
 # ==============================================================================
 # 本脚本只是薄封装，真正的发布流程在同级的 new-api-cf 仓库里：
-#   new-api-cf/scripts/local_deploy_hub.sh         本地：rsync 源码 + 触发远端切换
-#   new-api-cf/scripts/server_hub_blue_green_deploy.sh   服务器端：蓝绿热切换执行器
+#   new-api-cf/scripts/local_deploy_hub.sh                  本地：rsync 源码 + 触发远端切换
+#   new-api-cf/scripts/server_hub_blue_green_deploy.sh       服务器端：蓝绿热切换执行器
 #
 # 发布方式为 Nginx 反代 + PM2 双槽位蓝绿热切换：
 #   入口：127.0.0.1:8788（Nginx，upstream 见 /etc/nginx/snippets/upstream_hub.conf）
@@ -22,7 +22,6 @@ set -euo pipefail
 
 CN2_IP="82.158.229.151"
 NODE2_IP="45.207.212.73"
-ARCHIVED_GCP_IP="34.96.166.42"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NEW_API_CF_DIR="${NEW_API_CF_DIR:-${SCRIPT_DIR}/../new-api-cf}"
@@ -34,7 +33,7 @@ usage() {
   echo "  cn2    香港-CN2 Node 1  ${CN2_IP}"
   echo "  node2  香港-CN2 Node 2  ${NODE2_IP}"
   echo "  <IP>   任意自定义目标 IP"
-  echo "  （不传 -t 时默认 cn2；GCP ${ARCHIVED_GCP_IP} 已归档下线）"
+  echo "  （不传 -t 时默认 cn2）"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -62,18 +61,13 @@ if [ -z "$TARGET" ]; then
 fi
 
 case "$TARGET" in
-  cn2|hk-cn2|node1)
+  cn2)
     SERVER_IP="$CN2_IP"
     SERVER_NAME="香港-CN2 Node 1"
     ;;
-  node2|cn2-2|slave)
+  node2)
     SERVER_IP="$NODE2_IP"
     SERVER_NAME="香港-CN2 Node 2"
-    ;;
-  gcp|hk-gcp|"$ARCHIVED_GCP_IP")
-    echo "❌ GCP 节点 ${ARCHIVED_GCP_IP} 已归档下线（账号与号池已全部并入 CN2）。"
-    echo "   现役两台请用: -t cn2（${CN2_IP}）或 -t node2（${NODE2_IP}）"
-    exit 1
     ;;
   *)
     SERVER_IP="$TARGET"
