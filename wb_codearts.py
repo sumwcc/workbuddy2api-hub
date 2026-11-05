@@ -63,6 +63,13 @@ EP_CREDIT_CLAIM = "/v1/ops/claim"
 EP_CREDIT_CONFIRM = "/v1/ops/confirm"
 EP_PACKAGE_INFO = "/v1/statistics/plugin"
 
+#: 积分活动里「签到」的判据。控制台上的「每日签到赢100积分」是一条
+#: `USER_LOGIN` / `triggerEvent=user.login` 的 MANUAL_CLAIM 活动，
+#: 但 campaignId 每换季都会变（2026-10 是 34），所以按类型挑，不按 id 硬编码。
+#: 1 / 4 是历史 id（4 是「新用户注册送 4000 积分」），留着兼容老账号。
+CHECKIN_CAMPAIGN_IDS = (1, 4)
+CHECKIN_CAMPAIGN_TYPES = ("USER_LOGIN",)
+
 HEADER_MAAS_TYPE = "maas_type"
 MAAS_BENEFIT = "benefit"
 
@@ -99,8 +106,51 @@ DEFAULTS = {
     "models_ttl_seconds": 300.0,
     "max_concurrent": 1,
     "benefit_auto_claim": True,
-    "credits_auto_claim": True,
+    "credits_auto_claim": False,
 }
+
+#: Verified with the upstream validation error: reasoning_effort must be one of
+#: none/low/medium/high/xhigh/max. `minimal` is accepted but not in that list;
+#: `auto` is rejected.
+REASONING_EFFORTS = {
+    "deepseek-v4.1-flash": ["none", "low", "medium", "high", "xhigh", "max"],
+    "deepseek-v4.1-flash-1017": ["none", "low", "medium", "high",
+                                 "xhigh", "max"],
+    # Verified from the upstream validation message for the GLM backend.
+    "glm-5.2": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    "glm-5.2-sft-harmony": ["none", "minimal", "low", "medium", "high",
+                            "xhigh", "max"],
+    "glm-5.3": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    # Always-thinking model: upstream explicitly says only low/high/max.
+    "glm-5.3-flash": ["low", "high", "max"],
+}
+
+#: The upstream rejects an output-token request above the model's advertised
+#: limit with "The request param is invalid" instead of clamping it. When the
+#: catalogue has no limit (discovery failed), 65536 is the conservative cap
+#: verified for the CodeArts chat models.
+DEFAULT_MAX_OUTPUT_TOKENS = 65536
+
+
+def _requested_effort(payload):
+    """Resolve the client's reasoning level under every common spelling."""
+    if not isinstance(payload, dict):
+        return ""
+    effort = payload.get("reasoning_effort")
+    if effort is None:
+        effort = payload.get("reasoningEffort")
+    if effort is not None:
+        return str(effort).strip().lower()
+    thinking = payload.get("thinking")
+    if isinstance(thinking, dict):
+        kind = str(thinking.get("type") or "").strip().lower()
+        if kind == "disabled":
+            return "none"
+        if kind == "enabled":
+            return "high"
+    if "enable_thinking" in payload:
+        return "high" if payload.get("enable_thinking") else "none"
+    return ""
 
 _LOCK = threading.RLock()
 
@@ -178,37 +228,52 @@ def load_config(accounts_dir):
         "max_concurrent": _positive_int(
             raw.get("max_concurrent"), DEFAULTS["max_concurrent"], 1, 20),
         "benefit_auto_claim": raw.get("benefit_auto_claim", True) is not False,
-        "credits_auto_claim": raw.get("credits_auto_claim", True) is not False,
+        "credits_auto_claim": raw.get("credits_auto_claim", False) is True,
         "accounts_dir": accounts_dir,
     }
 
 
 def save_config(accounts_dir, patch):
-    """保存配置；返回完整配置。非法值抛 ValueError。"""
+    """保存配置；返回完整配置。非法值抛 ValueError。
+
+    整段读-改-写必须在 `_LOCK` 内完成。只靠 `wb_settings.save()` 内部那把锁
+    是不够的——它只保护「写」这一步，`load_config()` 读到的旧值到
+    `wb_settings.save()` 落盘之间有一个窗口。面板连续点两次保存、或者两个
+    浏览器同时保存时，后一次会用「读到旧值 + 自己那一项」覆盖掉前一次刚写
+    进去的另一项，且双方都拿到 200，没有任何报错。
+
+    锁序：这里持有 `_LOCK` 时会调用 `wb_settings.load/save`，它们各自持
+    `wb_settings._lock`。反向（`wb_settings` 持锁时调 `wb_codearts`）不存在，
+    见 `wb_settings.set_codearts_config()` —— 它只做转发，不持锁。所以
+    `_LOCK -> wb_settings._lock` 是唯一的获取顺序，不会死锁。
+    """
     if not isinstance(patch, dict):
         raise ValueError("codearts settings must be an object")
-    current = load_config(accounts_dir)
-    merged = dict(current)
-    for key in DEFAULTS:
-        if key in patch:
-            merged[key] = patch[key]
-    merged["enabled"] = merged.get("enabled") is True
-    merged["timeout_seconds"] = _positive_float(
-        merged.get("timeout_seconds"), DEFAULTS["timeout_seconds"], 1.0, 600.0)
-    merged["stream_timeout_seconds"] = _positive_float(
-        merged.get("stream_timeout_seconds"),
-        DEFAULTS["stream_timeout_seconds"], 1.0, 3600.0)
-    merged["models_ttl_seconds"] = _positive_float(
-        merged.get("models_ttl_seconds"), DEFAULTS["models_ttl_seconds"],
-        60.0, 86400.0)
-    merged["max_concurrent"] = _positive_int(
-        merged.get("max_concurrent"), DEFAULTS["max_concurrent"], 1, 20)
-    merged["benefit_auto_claim"] = merged.get("benefit_auto_claim", True) is not False
-    merged["credits_auto_claim"] = merged.get("credits_auto_claim", True) is not False
-    data = wb_settings.load(accounts_dir)
-    data["codearts"] = {k: merged[k] for k in DEFAULTS}
-    wb_settings.save(accounts_dir, data)
-    return load_config(accounts_dir)
+    with _LOCK:
+        current = load_config(accounts_dir)
+        merged = dict(current)
+        for key in DEFAULTS:
+            if key in patch:
+                merged[key] = patch[key]
+        merged["enabled"] = merged.get("enabled") is True
+        merged["timeout_seconds"] = _positive_float(
+            merged.get("timeout_seconds"), DEFAULTS["timeout_seconds"], 1.0, 600.0)
+        merged["stream_timeout_seconds"] = _positive_float(
+            merged.get("stream_timeout_seconds"),
+            DEFAULTS["stream_timeout_seconds"], 1.0, 3600.0)
+        merged["models_ttl_seconds"] = _positive_float(
+            merged.get("models_ttl_seconds"), DEFAULTS["models_ttl_seconds"],
+            60.0, 86400.0)
+        merged["max_concurrent"] = _positive_int(
+            merged.get("max_concurrent"), DEFAULTS["max_concurrent"], 1, 20)
+        merged["benefit_auto_claim"] = merged.get("benefit_auto_claim", True) is not False
+        merged["credits_auto_claim"] = merged.get("credits_auto_claim", False) is True
+        # 重新读 settings：`load_config` 只返回收敛后的 codearts 段，写回去要
+        # 保留其它段（api_keys / realm / 媒体配置…），所以必须拿整份再合并。
+        data = wb_settings.load(accounts_dir)
+        data["codearts"] = {k: merged[k] for k in DEFAULTS}
+        wb_settings.save(accounts_dir, data)
+        return load_config(accounts_dir)
 
 
 def configured(accounts_dir):
@@ -347,6 +412,8 @@ class CodeArtsAccount(object):
         self.model_benefit = {}
         self.models_fetched_at = 0.0
         self.checkin = None
+        self.note = ""
+        self.tasks_enabled = True
         self.info = None
         self.info_fetched_at = 0.0
         self._lock = threading.RLock()
@@ -449,6 +516,8 @@ class CodeArtsAccount(object):
             "models": len(self.models),
             "proxy_slot": self.proxy_slot,
             "proxy": self.proxy,
+            "note": self.note,
+            "tasks_enabled": bool(self.tasks_enabled),
         }
 
     def healthy(self, now=None):
@@ -459,6 +528,23 @@ class CodeArtsAccount(object):
         """
         now = now or time.time()
         return (not self.disabled) and now >= self.cool_until
+
+    def checked_in_today(self, now=None):
+        """Whether this account already completed a successful check-in today.
+
+        A failed attempt (``ok`` false) does not count, so a later slot can
+        retry after an earlier failure. The timestamp is local time, matching
+        the scheduler's clock.
+        """
+        entry = self.checkin if isinstance(self.checkin, dict) else {}
+        if not entry.get("ok"):
+            return False
+        text = str(entry.get("checked_at") or "")
+        if len(text) < 10:
+            return False
+        today = time.strftime("%Y-%m-%d",
+                              time.localtime(now if now is not None else time.time()))
+        return text[:10] == today
 
     def has_model(self, model):
         mid = str(model or "").lower()
@@ -499,6 +585,8 @@ class CodeArtsPool(object):
             acct.disabled = bool(entry.get("disabled"))
             acct.disabled_reason = str(entry.get("reason") or "")
             acct.last_error = str(entry.get("last_error") or "")
+            acct.note = str(entry.get("note") or "")[:200]
+            acct.tasks_enabled = bool(entry.get("tasks_enabled", True))
             if isinstance(entry.get("checkin"), dict):
                 acct.checkin = entry["checkin"]
             accounts.append(acct)
@@ -534,6 +622,8 @@ class CodeArtsPool(object):
                 "reason": acct.disabled_reason,
                 "last_error": acct.last_error,
                 "checkin": acct.checkin,
+                "note": acct.note,
+                "tasks_enabled": bool(acct.tasks_enabled),
             })
         try:
             _atomic_write(self.state_file, items)
@@ -659,6 +749,22 @@ class CodeArtsPool(object):
         self.save_state()
         return True
 
+    def set_note(self, uid, note):
+        acct = self.get(uid)
+        if acct is None:
+            return False
+        acct.note = str(note or "").strip()[:200]
+        self.save_state()
+        return True
+
+    def set_tasks_enabled(self, uid, enabled):
+        acct = self.get(uid)
+        if acct is None:
+            return False
+        acct.tasks_enabled = bool(enabled)
+        self.save_state()
+        return True
+
     # ---- 调度 ----
     def pick(self, model="", session_key=None, exclude=None, allowed_accounts=None):
         """按「能服务该模型 + 健康 + 并发未满」选一个账号。"""
@@ -734,7 +840,7 @@ _POOLS = {}
 _POOLS_LOCK = threading.Lock()
 
 
-def pool_for(accounts_dir):
+def pool_for(accounts_dir, trigger_auto=True):
     """按 accounts_dir 取单例池；配置变化时刷新池配置。"""
     key = os.path.abspath(str(accounts_dir or "."))
     cfg = load_config(accounts_dir)
@@ -747,7 +853,10 @@ def pool_for(accounts_dir):
             pool.config = cfg
             for acct in pool.accounts:
                 acct.max_concurrent = cfg.get("max_concurrent", 1)
-        return pool
+    # 锁外触发：自动签到只做判断/记账，真正的领积分在后台线程里跑。
+    if trigger_auto:
+        _maybe_auto_checkin(pool)
+    return pool
 
 
 def invalidate_pool(accounts_dir=None):
@@ -988,6 +1097,44 @@ def _canonical_model(acct, model):
     return static.get(lower, mid)
 
 
+#: CodeArts models known to read images even when a discovery source omits
+#: `supports_images`. Deliberately CodeArts-specific: several overlapping ids
+#: are marked as vision by other catalogues, but the CodeArts backend answers
+#: "The request model is not multimodal" for them.
+_KNOWN_VISION_IDS = {
+    "qwen3-vl-235b", "qwen3.5-397b-a17b-vl",
+    "qwen3.6-27b-vl", "kimi-k2.6-vl",
+}
+
+
+def _known_vision(mid):
+    """Fallback vision metadata when a discovery source omits the flag."""
+    return str(mid or "").strip().lower() in _KNOWN_VISION_IDS
+
+
+def _wb_catalog_limits(mid):
+    """Context/output limits from the WorkBuddy catalog for the same model id.
+
+    CodeArts' builtin list often omits context_window/max_tokens. For ids that
+    are the same backend model, the WorkBuddy catalogue has the spec; use it as
+    a fallback rather than advertising no limit at all.
+    """
+    key = str(mid or "").strip().lower()
+    if not key:
+        return 0, 0
+    try:
+        import wb_catalog
+        for table in (wb_catalog.STATIC_MODELS, wb_catalog.STATIC_CN_MODELS):
+            for item in table:
+                if str(item.get("id") or "").strip().lower() != key:
+                    continue
+                return (int(item.get("maxInputTokens") or 0),
+                        int(item.get("maxOutputTokens") or 0))
+    except Exception:
+        pass
+    return 0, 0
+
+
 def _merge_models(sets):
     merged = {}
     for source, items in sets:
@@ -1005,6 +1152,11 @@ def _merge_models(sets):
                     "max_tokens": int(item.get("max_tokens") or 0),
                     "desc": str(item.get("desc") or ""),
                     "benefit": bool(item.get("benefit")),
+                    "supports_images": (item.get("supports_images")
+                                        if isinstance(item.get("supports_images"), bool)
+                                        else None),
+                    "model_category": str(item.get("model_category") or ""),
+                    "credits": str(item.get("credits") or ""),
                 }
                 continue
             if not current.get("context_window") and item.get("context_window"):
@@ -1015,6 +1167,15 @@ def _merge_models(sets):
                 current["benefit"] = True
             if not current.get("desc") and item.get("desc"):
                 current["desc"] = item["desc"]
+            if item.get("supports_images") is True:
+                current["supports_images"] = True
+            elif (item.get("supports_images") is False
+                  and current.get("supports_images") is None):
+                current["supports_images"] = False
+            if not current.get("model_category") and item.get("model_category"):
+                current["model_category"] = item["model_category"]
+            if not current.get("credits") and item.get("credits"):
+                current["credits"] = item["credits"]
     return list(merged.values())
 
 
@@ -1052,6 +1213,7 @@ def _fetch_agent_models(acct, timeout):
                or item.get("model_alias") or params.get("model_id") or "")
         if not mid:
             continue
+        supports = params.get("supports_images", item.get("supports_images"))
         out.append({
             "id": str(mid),
             "name": str(mid),
@@ -1059,8 +1221,35 @@ def _fetch_agent_models(acct, timeout):
             "max_tokens": int(params.get("max_tokens") or 0),
             "desc": str(params.get("model_desc") or ""),
             "benefit": False,
+            "supports_images": (supports if isinstance(supports, bool) else None),
+            "model_category": str(params.get("model_category")
+                                  or item.get("model_category") or ""),
         })
     return out
+
+
+def _credit_label(rows):
+    """The multiplier a request normally pays, in the catalogue's `x0.18` form.
+
+    `credit` holds one row per input-length tier and, on some models, one per
+    time slot. An `off_peak` row is a discount (its `before_display_ratio` is
+    the regular rate), so it must not be advertised as the model's price. A
+    model without a usable row stays blank: no multiplier does not mean free.
+    """
+    for row in rows if isinstance(rows, list) else ():
+        if not isinstance(row, dict):
+            continue
+        if row.get("time_slot_id") not in (None, "", "default"):
+            continue
+        text = str(row.get("ratio_display") or "").strip().lower()
+        if not text.endswith("x"):
+            continue
+        try:
+            float(text[:-1])
+        except ValueError:
+            continue
+        return "x" + text[:-1]
+    return ""
 
 
 def _fetch_builtin_models(acct, timeout):
@@ -1078,6 +1267,11 @@ def _fetch_builtin_models(acct, timeout):
             "max_tokens": int(item.get("max_tokens") or 0),
             "desc": str(item.get("model_desc") or ""),
             "benefit": False,
+            "supports_images": (item.get("supports_images")
+                                if isinstance(item.get("supports_images"), bool)
+                                else None),
+            "model_category": str(item.get("model_category") or ""),
+            "credits": _credit_label(item.get("credit")),
         })
     return out
 
@@ -1108,6 +1302,10 @@ def _fetch_benefit_models(acct, timeout, auto_claim=True):
             "max_tokens": int(item.get("max_tokens") or 0),
             "desc": str(item.get("model_desc") or ""),
             "benefit": True,
+            "supports_images": (item.get("supports_images")
+                                if isinstance(item.get("supports_images"), bool)
+                                else None),
+            "model_category": str(item.get("model_category") or ""),
         })
     return out
 
@@ -1144,7 +1342,8 @@ def fetch_models(acct, timeout=20.0, auto_claim=True):
             return acct.models
         merged = _merge_models([("seed", [
             {"id": mid, "name": mid,
-             "benefit": mid.lower() in {m.lower() for m in SEED_BENEFIT_MODELS}}
+             "benefit": mid.lower() in {m.lower() for m in SEED_BENEFIT_MODELS},
+             "supports_images": _known_vision(mid)}
             for mid in SEED_MODELS])])
     acct.models = merged
     acct.model_benefit = {str(m["id"]).lower(): bool(m.get("benefit"))
@@ -1188,7 +1387,8 @@ def model_entries(config):
     if not merged:
         merged = _merge_models([("seed", [
             {"id": mid, "name": mid,
-             "benefit": mid.lower() in {m.lower() for m in SEED_BENEFIT_MODELS}}
+             "benefit": mid.lower() in {m.lower() for m in SEED_BENEFIT_MODELS},
+             "supports_images": _known_vision(mid)}
             for mid in SEED_MODELS])])
     now = int(time.time())
     out = []
@@ -1201,12 +1401,62 @@ def model_entries(config):
             "provider": "codearts",
             "name": item.get("name") or item["id"],
         }
-        if item.get("context_window"):
-            entry["context_window"] = item["context_window"]
-        if item.get("max_tokens"):
-            entry["max_tokens"] = item["max_tokens"]
+        ctx = int(item.get("context_window") or 0)
+        out_tokens = int(item.get("max_tokens") or 0)
+        if not ctx or not out_tokens:
+            wb_ctx, wb_out = _wb_catalog_limits(item["id"])
+            ctx = ctx or wb_ctx
+            out_tokens = out_tokens or wb_out
+        if ctx:
+            entry["context_window"] = ctx
+            entry["context_length"] = ctx
+            entry["max_input_tokens"] = ctx
+        if out_tokens:
+            entry["max_tokens"] = out_tokens
+            entry["max_output_tokens"] = out_tokens
+            entry["max_completion_tokens"] = out_tokens
+            entry["max_output"] = out_tokens
         if item.get("benefit"):
             entry["benefit"] = True
+        if item.get("credits"):
+            entry["credits"] = item["credits"]
+        supports = item.get("supports_images")
+        if not isinstance(supports, bool):
+            supports = _known_vision(item["id"])
+        vision = bool(supports)
+        inputs = ["text"] + (["image"] if vision else [])
+        # Same convention set WorkBuddy emits: clients read different spellings
+        # for vision support, and some clients need input modalities.
+        entry["capabilities"] = {"vision": vision, "tool_calls": True}
+        entry["supports_vision"] = vision
+        entry["supports_images"] = vision
+        entry["supports_tool_calls"] = True
+        entry["vision"] = vision
+        entry["multimodal"] = vision
+        entry["abilities"] = {"vision": vision, "functionCall": True,
+                              "function_call": True}
+        entry["input_modalities"] = inputs
+        entry["output_modalities"] = ["text"]
+        entry["modalities"] = {"input": inputs, "output": ["text"]}
+        entry["architecture"] = {
+            "input_modalities": inputs,
+            "output_modalities": ["text"],
+            "modality": "+".join(inputs) + "->text",
+        }
+        if item.get("desc"):
+            entry["description"] = item["desc"]
+        if item.get("model_category"):
+            entry["category"] = item["model_category"]
+        efforts = REASONING_EFFORTS.get(str(item["id"]).lower())
+        if efforts:
+            entry["reasoning_efforts"] = list(efforts)
+            entry["supports_reasoning"] = True
+            capabilities = entry.setdefault(
+                "capabilities", {"vision": False, "tool_calls": True})
+            capabilities["reasoning"] = True
+        if str(item["id"]).lower() == "glm-5.3-flash":
+            entry["reasoning_can_disable"] = False
+            entry["always_reasoning"] = True
         out.append(entry)
     return out
 
@@ -1267,19 +1517,80 @@ def _derive_chat_id(session_key, messages):
     return secrets.token_hex(16)
 
 
+def _ot_session_id(acct):
+    """账号级稳定的会话 id：同一账号永远同一个，重启 / 续期都不变。"""
+    import hashlib
+    raw = "codearts-ot-session:" + str(getattr(acct, "uid", "") or "")
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _ot_session_enabled():
+    """默认发送会话头；WB_CODEARTS_OT_SESSION=0 时退回旧行为（便于对照）。"""
+    value = os.environ.get("WB_CODEARTS_OT_SESSION", "").strip().lower()
+    return value not in ("0", "false", "no", "off")
+
+
 def _flatten_content(content):
-    """把 OpenAI 内容分片压成纯文本；CodeArts 只消费 text 分片。"""
+    """Normalize text/image content parts for CodeArts.
+
+    CodeArts accepts OpenAI-style content arrays on `/api/v2/chat/completions`:
+    `{"type":"text","text":...}` and
+    `{"type":"image_url","image_url":{"url":"data:..." | "https://..."}}`.
+    Text-only content is still flattened to a string so existing requests keep
+    their exact wire shape; any image part switches the message to a structured
+    array. Anthropic `image` blocks and Responses `input_image` parts are
+    normalized to the same `image_url` shape.
+    """
     if content is None:
         return ""
     if isinstance(content, str):
         return content
-    if isinstance(content, list):
-        if any(isinstance(part, dict) and (part.get("type") in ("image", "image_url", "input_image")
-                                         or "image_url" in part) for part in content):
-            raise CodeArtsBadRequest("CodeArts 出口暂不支持图片输入，请移除图片或选择其他出口")
-        return "".join(str(part.get("text") or "")
-                       for part in content if isinstance(part, dict))
-    return str(content)
+    if not isinstance(content, list):
+        return str(content)
+    parts = []
+    for piece in content:
+        if isinstance(piece, str):
+            parts.append({"type": "text", "text": piece})
+            continue
+        if not isinstance(piece, dict):
+            continue
+        ptype = str(piece.get("type") or "")
+        if ptype in ("text", "input_text", "output_text", "summary_text"):
+            text = piece.get("text")
+            if text is not None:
+                parts.append({"type": "text", "text": str(text)})
+            continue
+        if ptype not in ("image_url", "input_image", "image") \
+                and "image_url" not in piece:
+            continue
+        raw = piece.get("image_url") or piece.get("url")
+        url = ""
+        if isinstance(raw, dict):
+            url = str(raw.get("url") or "")
+        elif raw:
+            url = str(raw)
+        if not url and isinstance(piece.get("source"), dict):
+            source = piece["source"]
+            stype = str(source.get("type") or "")
+            if stype == "base64":
+                media = str(source.get("media_type") or "image/png")
+                data = str(source.get("data") or "")
+                if data:
+                    url = "data:%s;base64,%s" % (media, data)
+            elif stype == "url":
+                url = str(source.get("url") or "")
+        if not url and piece.get("data"):
+            mime = str(piece.get("mimeType")
+                       or piece.get("mime_type") or "image/png")
+            url = "data:%s;base64,%s" % (mime, piece["data"])
+        if url:
+            image = {"url": url}
+            if isinstance(raw, dict) and raw.get("detail"):
+                image["detail"] = str(raw["detail"])
+            parts.append({"type": "image_url", "image_url": image})
+    if any(part.get("type") == "image_url" for part in parts):
+        return parts
+    return "".join(str(part.get("text") or "") for part in parts)
 
 
 def build_chat_body(payload, session_key=None):
@@ -1287,15 +1598,35 @@ def build_chat_body(payload, session_key=None):
     if not isinstance(payload, dict):
         raise CodeArtsBadRequest("request body must be a JSON object")
     from wb_proxy import (cleanup_orphan_tool_calls, merge_adjacent_tool_calls,
-                          normalize_roles, repack_tool_result_blocks)
+                          normalize_roles, normalize_tools,
+                          repack_tool_result_blocks)
     # 只发 Go 版 chatBodyV2 会发的字段；客户端多出来的采样/格式字段一律丢掉，
     # 避免华为网关对未知字段返回 400。
     allowed = {
         "model", "messages", "temperature", "top_p", "max_tokens",
         "max_completion_tokens", "reasoning_effort", "tools", "tool_choice",
+        # Verified against the CodeArts upstream: it accepts these and applies
+        # them, but the earlier narrow allow-list silently dropped them.
+        "stop", "frequency_penalty", "presence_penalty", "seed",
+        "response_format", "top_k", "parallel_tool_calls",
     }
     body = {str(k): v for k, v in payload.items() if str(k) in allowed}
     body["model"] = str(payload.get("model") or "GLM-5.2")
+    effort_text = _requested_effort(payload)
+    allowed_efforts = REASONING_EFFORTS.get(body["model"].lower())
+    if effort_text:
+        if allowed_efforts and effort_text not in allowed_efforts:
+            if effort_text == "none" and "none" not in allowed_efforts:
+                # Always-thinking models cannot disable reasoning; use their
+                # first accepted level instead of failing the whole request.
+                effort_text = allowed_efforts[0]
+            else:
+                raise CodeArtsBadRequest(
+                    "reasoning_effort must be one of %s for %s"
+                    % ("/".join(allowed_efforts), body["model"]))
+        body["reasoning_effort"] = effort_text
+    else:
+        body.pop("reasoning_effort", None)
     messages = normalize_roles(payload.get("messages") or [])
     messages = [m for m in messages if isinstance(m, dict)]
     flattened = []
@@ -1311,6 +1642,14 @@ def build_chat_body(payload, session_key=None):
     if not messages:
         raise CodeArtsBadRequest("messages is empty")
     body["messages"] = messages
+    # CodeArts builds its own chat body and therefore bypasses the generic
+    # normalize_tools() pass. A client tool entry without a usable
+    # ``function`` object (``{"type": "function"}``, a bare server tool such
+    # as ``{"type": "web_search"}``, or a flat ``{"name": ...}`` declaration)
+    # is forwarded as-is and the upstream rejects the whole request with
+    # "Tool function cannot empty". Repair the common shapes and drop the
+    # entries that still cannot satisfy the function schema.
+    normalize_tools(body)
     # 指定函数名时 CodeArts 只认字符串 required：把工具清单收窄到该函数，
     # 再把 tool_choice 改成 required（与 Go 版 nativeTools 一致）。
     tools = body.get("tools")
@@ -1332,6 +1671,9 @@ def build_chat_body(payload, session_key=None):
             body.pop("tool_choice", None)
     if not body.get("tools"):
         body.pop("tool_choice", None)
+    stop = body.get("stop")
+    if isinstance(stop, str):
+        body["stop"] = [stop]
     if body.get("max_completion_tokens") is not None and body.get("max_tokens") is None:
         body["max_tokens"] = body.pop("max_completion_tokens")
     chat_id = payload.get("conversation_id")
@@ -1425,9 +1767,14 @@ class CodeArtsStream(object):
             return
         code = payload.get("error_code") or payload.get("code")
         if code not in (None, "", 0, "0"):
-            raise CodeArtsUpstreamError(
-                str(payload.get("error_msg") or payload.get("message") or text)[:300],
-                code=str(code))
+            message = str(payload.get("error_msg") or payload.get("message")
+                          or text)[:300]
+            lowered = message.lower()
+            if ("request param is invalid" in lowered
+                    or "request model is not multimodal" in lowered
+                    or "tool function cannot empty" in lowered):
+                raise CodeArtsBadRequest(message, status=400, code=str(code))
+            raise CodeArtsUpstreamError(message, code=str(code))
 
     def _chunk(self, delta, finish=None):
         payload = {
@@ -1574,6 +1921,53 @@ def _is_concurrency_message(message):
             in text)
 
 
+def _model_output_limit(acct, model):
+    """Advertised output limit for the canonical CodeArts model."""
+    key = str(model or "").strip().lower()
+    for item in acct.models or ():
+        if str(item.get("id") or "").strip().lower() != key:
+            continue
+        for field in ("max_tokens", "max_output_tokens",
+                      "max_completion_tokens"):
+            try:
+                value = int(item.get(field) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+    try:
+        _ctx, value = _wb_catalog_limits(model)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return DEFAULT_MAX_OUTPUT_TOKENS
+
+
+def _clamp_output_tokens(acct, model, body):
+    """Keep an explicit output limit within what CodeArts advertises."""
+    key = "max_tokens" if body.get("max_tokens") is not None else (
+        "max_completion_tokens" if body.get("max_completion_tokens") is not None
+        else "")
+    if not key:
+        return
+    raw = body.get(key)
+    if isinstance(raw, bool):
+        raise CodeArtsBadRequest("%s must be a positive integer" % key,
+                                 status=400)
+    try:
+        requested = int(raw)
+    except (TypeError, ValueError):
+        raise CodeArtsBadRequest("%s must be a positive integer" % key,
+                                 status=400)
+    if requested <= 0:
+        raise CodeArtsBadRequest("%s must be a positive integer" % key,
+                                 status=400)
+    limit = _model_output_limit(acct, model)
+    if requested > limit:
+        body[key] = limit
+
+
 def _client_chat(acct, body, session_key):
     model = _canonical_model(acct, body.get("model"))
     chat_id = body.get("chat_id") or _derive_chat_id(session_key, body.get("messages"))
@@ -1587,12 +1981,21 @@ def _client_chat(acct, body, session_key):
     upstream_body["prompt_cache_key"] = chat_id
     upstream_body["stream"] = True
     upstream_body["tool_stream"] = True
+    _clamp_output_tokens(acct, model, upstream_body)
     raw = json.dumps(upstream_body, ensure_ascii=False).encode("utf-8")
     headers = _chat_headers(acct, chat_id, session_id, acct.is_benefit(model))
     headers = _signed_headers(acct, "POST", SNAP_HOST + EP_CHAT, headers, raw)
     # 与 Go 版一致：Chat-Id / Session-Id 在签名之后才加，不进入 SignedHeaders。
     headers["Chat-Id"] = chat_id
     headers["Session-Id"] = session_id
+    if _ot_session_enabled():
+        # 网关按 x-ot-session-id 统计每账号的并发会话：不发这个头时每个请求都是
+        # 一个新会话，会话结束后还占位约 60 秒，3 个名额很快被自己的历史请求占满。
+        # Chat-Id / Session-Id 不参与这个计数。三个头都在签名之后追加，不进 SignedHeaders。
+        ot_session = _ot_session_id(acct)
+        headers["x-ot-session-id"] = ot_session
+        headers["user-session-id"] = ot_session
+        headers["x-ot-trace-id"] = secrets.token_hex(16)
     timeout = float(acct.pool.config.get("stream_timeout_seconds")
                     or DEFAULTS["stream_timeout_seconds"])
     last_error = None
@@ -1658,6 +2061,9 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
         acct = pool.pick(model, session_key=session_key, exclude=exclude,
                          allowed_accounts=allowed_accounts)
         if acct is None:
+            if pool.accounts and any(a.active_concurrent > 0 for a in pool.accounts):
+                time.sleep(0.05)
+                continue
             break
         if not pool.acquire(acct):
             exclude.add(acct.uid)
@@ -1987,16 +2393,36 @@ def oauth_callback(config, session_id, callback_url):
 
 
 def oauth_callback_get(config, query):
-    """浏览器 GET /oauth/callback 的处理；返回 HTML。"""
+    """浏览器 GET /oauth/callback 的处理；返回 HTML。
+
+    华为云的授权回调会把授权链接里的 `ticket_id` 改写成 `state` 再送回来
+    （实测：授权 URL 带 `ticket_id=<32 hex>`，回调带 `state=<hex>.pkg`），
+    所以这里必须两个名字都认；只认 `ticket_id` 会让每一个浏览器回调都
+    撞上「回调缺少会话标识」，用户只能手工拼 URL 才能登录。
+
+    刻意**不做**「猜最近一个 pending 会话」的兜底：没有会话标识的回调按
+    设计就该被拒（既有测试 `_test_codearts_admin.py` 钉住了这条），用过期
+    或陌生的回调去兑换 token 只会把错误搅浑。这里只做精确匹配。
+    """
     def value(key):
         raw = query.get(key)
         if isinstance(raw, list):
             return raw[0] if raw else ""
         return raw or ""
     ticket_id, callback_secret = value("ticket_id"), value("secret")
-    if not ticket_id and not callback_secret:
+    state = value("state")
+    if not ticket_id and not callback_secret and not state:
         return 400, "<h3>回调缺少会话标识，请回到看板粘贴完整回调地址。</h3>"
-    session = _find_session(ticket_id=ticket_id, secret=callback_secret)
+    session = None
+    if ticket_id or callback_secret:
+        session = _find_session(ticket_id=ticket_id, secret=callback_secret)
+    if session is None and state:
+        # 华为云的回调形态：ticket_id 被改名成 state。逐级尝试，
+        # 全部精确匹配，不做「随便找一个 pending」的猜测。
+        for candidate in _state_candidates(state):
+            session = _find_session(ticket_id=candidate)
+            if session is not None:
+                break
     if session is None:
         return 400, "<h3>登录会话不存在或已过期，请回到看板重新发起。</h3>"
     code = value("code")
@@ -2022,6 +2448,26 @@ def oauth_callback_get(config, query):
         import html as html_module
         return 400, "<h3>登录失败：%s</h3>" % html_module.escape(str(exc))
     return 400, "<h3>回调地址缺少 code 或 secret。</h3>"
+
+
+def _state_candidates(state):
+    """把回调的 `state` 展开成若干可能的 ticket_id，按可信度排列。
+
+    实测华为云回传的 `state` 是 `<ticket_id>.pkg` 形状（ticket_id 为 32 位
+    hex），同时也见过原样回传。这里两种形状都给出来，由 `_find_session()`
+    做精确匹配——一个都匹配不上就返回 None，绝不会登进错误的会话。
+    """
+    text = str(state or "").strip()
+    if not text:
+        return []
+    out = []
+    head = text.split(".", 1)[0]
+    if head and head != text:
+        out.append(head)
+    out.append(text)
+    # 去重但保序；ticket_id 只可能是 hex，非 hex 的候选留着也无害（匹配不上）。
+    seen = set()
+    return [x for x in out if x and not (x in seen or seen.add(x))]
 
 
 # ---------------------------------------------------------------------------
@@ -2220,6 +2666,66 @@ def clear_cooldown(config, uid):
     return {"ok": True, "message": "已清冷却 %s" % uid}
 
 
+def set_note(config, uid, note):
+    pool = pool_for(config["accounts_dir"])
+    if not pool.set_note(uid, note):
+        raise CodeArtsNotFound("account not found")
+    invalidate_overview()
+    return {"ok": True, "uid": uid, "note": pool.get(uid).note}
+
+
+def set_tasks_enabled(config, uid, enabled):
+    pool = pool_for(config["accounts_dir"], trigger_auto=False)
+    if not pool.set_tasks_enabled(uid, enabled):
+        raise CodeArtsNotFound("account not found")
+    invalidate_overview()
+    return {"ok": True, "uid": uid,
+            "tasks_enabled": bool(pool.get(uid).tasks_enabled)}
+
+
+def refresh_credits(config):
+    pool = pool_for(config["accounts_dir"])
+    refreshed = 0
+    errors = []
+    for acct in list(pool.accounts):
+        if acct.disabled:
+            continue
+        try:
+            _ensure_token(acct)
+            ensure_account_info(acct, force=True, timeout=15.0)
+            refreshed += 1
+        except CodeArtsError as exc:
+            errors.append("%s: %s" % (acct.nickname, str(exc)[:160]))
+    invalidate_overview()
+    return {
+        "ok": not errors,
+        "refreshed": refreshed,
+        "errors": errors[:3],
+        "message": "已刷新 %d 个账号的积分" % refreshed,
+    }
+
+
+def test_account(config, uid):
+    pool = pool_for(config["accounts_dir"])
+    acct = pool.get(uid)
+    if acct is None:
+        raise CodeArtsNotFound("account not found")
+    try:
+        _ensure_token(acct)
+        ensure_models(acct, force=True, timeout=15.0)
+        info = fetch_account_info(acct, timeout=15.0)
+        total = (info.get("credits") or {}).get("total") or {}
+        return {
+            "ok": True,
+            "uid": uid,
+            "models": len(acct.models),
+            "credits": total.get("remain"),
+            "message": "连接正常",
+        }
+    except CodeArtsError as exc:
+        return {"ok": False, "uid": uid, "message": str(exc)[:300]}
+
+
 def apply_proxy_slots(accounts_dir, slots=None):
     """Re-resolve CodeArts account exits after the panel saves slots."""
     pool_for(accounts_dir).apply_proxy_slots(slots)
@@ -2286,7 +2792,48 @@ def _credit_request(acct, method, path, payload=None, timeout=30.0):
                        agent_type="PromptCenter")
 
 
+def _is_checkin_campaign(item):
+    """这条积分活动是不是「签到类」，值得领取。
+
+    以前按 campaignId 白名单 `(1, 4)` 过滤，每日签到换成 id=34 以后整条被
+    跳过——面板点「签到」只会回「新用户注册送 4000 积分: 已领取」，看似成功
+    其实一分没进。改成按活动类型/触发事件判断，换季也不怕。
+    """
+    if item.get("campaignId") in CHECKIN_CAMPAIGN_IDS:
+        return True
+    if str(item.get("type") or "").upper() in CHECKIN_CAMPAIGN_TYPES:
+        return True
+    return str((item.get("extra") or {}).get("triggerEvent")
+               or "").lower() == "user.login"
+
+
+_CHECKIN_LOCKS = {}
+_CHECKIN_LOCKS_LOCK = threading.Lock()
+
+
+def _checkin_lock(uid):
+    """每个账号一把签到锁（进程内），面板点击与自动签到撞车时只放一个过去。"""
+    with _CHECKIN_LOCKS_LOCK:
+        lock = _CHECKIN_LOCKS.get(uid)
+        if lock is None:
+            lock = threading.Lock()
+            _CHECKIN_LOCKS[uid] = lock
+        return lock
+
+
 def checkin_account(acct, timeout=30.0):
+    """签到入口：同账号串行，避免两条路径同时 claim 同一条活动。"""
+    lock = _checkin_lock(acct.uid)
+    if not lock.acquire(False):
+        return {"ok": False, "credits": 0.0, "campaigns": [],
+                "message": "该账号签到正在进行中，稍后刷新即可"}
+    try:
+        return _checkin_account(acct, timeout=timeout)
+    finally:
+        lock.release()
+
+
+def _checkin_account(acct, timeout=30.0):
     data = _credit_request(acct, "GET",
                            EP_CREDIT_DELIVERY + "?channel=IDE",
                            timeout=timeout)
@@ -2295,7 +2842,7 @@ def checkin_account(acct, timeout=30.0):
     total_credits = 0.0
     for item in items:
         campaign_id = item.get("campaignId")
-        if campaign_id not in (1, 4):
+        if not _is_checkin_campaign(item):
             continue
         status = str(item.get("status") or "").strip()
         title = str(item.get("title") or ("积分活动 %s" % campaign_id))
@@ -2345,7 +2892,23 @@ def checkin_account(acct, timeout=30.0):
     return result
 
 
+#: 手动签到路径（面板按钮 / API）里的抑制标记：那条路径自己就要签，不该再让
+#: 后台线程去抢同一把锁（否则按钮的回复会变成「该账号签到正在进行中」）。
+#: 用 thread-local，只影响当前请求线程，别的请求照常触发自动签到。
+_AUTO_CHECKIN_SUPPRESS = threading.local()
+
+
 def checkin(config, uid=""):
+    """手动签到入口（面板按钮 / `/codearts/accounts/checkin`）。"""
+    depth = getattr(_AUTO_CHECKIN_SUPPRESS, "depth", 0)
+    _AUTO_CHECKIN_SUPPRESS.depth = depth + 1
+    try:
+        return _checkin(config, uid)
+    finally:
+        _AUTO_CHECKIN_SUPPRESS.depth = depth
+
+
+def _checkin(config, uid=""):
     pool = pool_for(config["accounts_dir"])
     if uid:
         acct = pool.get(uid)
@@ -2367,3 +2930,85 @@ def checkin(config, uid=""):
             "credits": total,
             "message": "已处理 %d 个账号，共领取 %g 积分" % (len(results), total),
             "results": results}
+
+
+# ---------------------------------------------------------------------------
+# 每日自动签到（惰性触发）
+#
+# 签到的积分是 MANUAL_CLAIM 活动，没有任何定时器会来领：`wb_scheduler` 只排
+# 国内版账号（`acc.realm == "cn"`），面板按钮又只能人工点。于是每天那 100
+# 积分经常整天没人领，而它**次日就过期**（`expireAt` 只到第二天），等于白丢。
+#
+# 这里不新开定时线程池，只在池被用到时（每个 CodeArts 请求、/health、面板
+# 刷新都会经过 pool_for）检查一次「今天还有谁没签」，有就起一个 daemon 线程
+# 去领。节流记在进程内：每个账号每天最多 `AUTO_CHECKIN_MAX_ATTEMPTS` 次、
+# 两次间隔 ≥ `AUTO_CHECKIN_RETRY_GAP`，所以上游抖动也不会被连打。
+# 代价是网关整天没人请求时不会签——那种日子本来也没有消耗积分的请求。
+# ---------------------------------------------------------------------------
+
+#: 每个账号每天最多尝试几次（失败重试用）。
+AUTO_CHECKIN_MAX_ATTEMPTS = 3
+#: 同一账号两次尝试之间的最短间隔（秒）。
+AUTO_CHECKIN_RETRY_GAP = 3600.0
+
+_AUTO_CHECKIN_LOCK = threading.Lock()
+#: {accounts_dir: {uid: [日期, 已尝试次数, 上次尝试时刻]}}
+_AUTO_CHECKIN_STATE = {}
+
+
+def _checked_in_today(acct, today):
+    """这个账号今天已经签到成功了吗（看落盘的 checkin 记录）。"""
+    info = acct.checkin if isinstance(acct.checkin, dict) else {}
+    if not info.get("ok"):
+        return False
+    return str(info.get("checked_at") or "").startswith(today)
+
+
+def _auto_checkin_worker(accounts):
+    """后台线程：逐个领签到积分；任何失败都咽掉，绝不影响正在跑的会话。"""
+    for acct in accounts:
+        if acct.disabled or not getattr(acct, "tasks_enabled", True):
+            continue
+        try:
+            _ensure_token(acct)
+            checkin_account(acct)
+        except CodeArtsError:
+            pass
+        except Exception:  # noqa: BLE001 - 后台任务，不能把异常抛给调用方
+            pass
+
+
+def _maybe_auto_checkin(pool):
+    """惰性触发每日签到；同步部分只做判断与记账，真正的请求在后台线程。"""
+    try:
+        if getattr(_AUTO_CHECKIN_SUPPRESS, "depth", 0):
+            return                      # 本线程正在手动签到，别抢
+        if not pool.config.get("credits_auto_claim", False):
+            return
+        today = time.strftime("%Y-%m-%d")
+        now = time.time()
+        key = os.path.abspath(str(pool.accounts_dir or "."))
+        pending = []
+        with _AUTO_CHECKIN_LOCK:
+            state = dict(_AUTO_CHECKIN_STATE.get(key) or {})
+            for acct in list(pool.accounts):
+                if acct.disabled or not acct.uid or not getattr(acct, "tasks_enabled", True):
+                    continue
+                if _checked_in_today(acct, today):
+                    continue
+                entry = state.get(acct.uid) or [today, 0, 0.0]
+                if entry[0] != today:
+                    entry = [today, 0, 0.0]      # 跨天重置
+                if entry[1] >= AUTO_CHECKIN_MAX_ATTEMPTS:
+                    continue
+                if entry[2] and now - entry[2] < AUTO_CHECKIN_RETRY_GAP:
+                    continue
+                state[acct.uid] = [today, entry[1] + 1, now]
+                pending.append(acct)
+            _AUTO_CHECKIN_STATE[key] = state
+        if not pending:
+            return
+        threading.Thread(target=_auto_checkin_worker, args=(pending,),
+                         name="codearts-auto-checkin", daemon=True).start()
+    except Exception:  # noqa: BLE001 - 自动签到坏了也不能让业务请求失败
+        return
