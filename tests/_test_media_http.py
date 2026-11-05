@@ -29,6 +29,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from _lifecycle import free_port, spawn_managed, stop_managed
 
+import wb_proxy  # noqa: E402  （只读两个上限常量，与子进程同一份默认值）
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 API_KEY = "sk-media-http-test"
 
@@ -331,9 +333,16 @@ class PayloadLimitTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_26mb_is_rejected_before_the_body_is_read(self):
-        """26 MB 超出媒体的 24 MB 上限 → 413，且不读 body。"""
-        status, body = self._declared_length("/v1/images/generations", 26 * 1024 * 1024)
+    def test_over_the_media_limit_is_rejected_before_the_body_is_read(self):
+        """超出媒体有效上限 max(通用上限, 24 MB) → 413，且不读 body。
+
+        二开注：本仓库把通用上限保留在 50 MB（对齐前置 nginx 的
+        `client_max_body_size 50M`），所以媒体有效上限是 50 MB，而不是上游默认
+        16 MB 时的 24 MB。这里按实际生效的上限取声明长度，断言不放水。
+        """
+        limit = max(wb_proxy.MAX_PAYLOAD_BYTES, wb_proxy.MEDIA_MAX_PAYLOAD_BYTES)
+        status, body = self._declared_length("/v1/images/generations",
+                                            limit + 2 * 1024 * 1024)
         self.assertEqual(status, 413)
         self.assertIn("payload too large", body.decode("utf-8", "replace"))
 

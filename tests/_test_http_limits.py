@@ -9,9 +9,12 @@
   - GatewayServer.request_queue_size：stdlib 默认 backlog=5，突发并发下内核来
     不及 accept 的 SYN 被丢弃、客户端按 1s 粒度重传（真机 64 并发突发 43/64
     卡 >=1s；backlog=128 后 0/64）。
-  - MAX_PAYLOAD_BYTES 默认 50MB -> 16MB：读 body 发生在 chat 信号量 acquire
-    之前、线程数又无上限，50MB body 单请求峰值 ~160MB，而路由器可用内存只有
-    ~480MB。
+  - MAX_PAYLOAD_BYTES 默认保持 50MB：上游 v1.10.11 为路由器（可用内存仅
+    ~480MB）把它收到 16MB——读 body 发生在 chat 信号量 acquire 之前、线程数又
+    无上限，50MB body 单请求峰值 ~160MB。本二开仓库面对的是 8GB 云主机且前置
+    nginx 允许 50M，故保留 50MB 以对齐 `client_max_body_size 50M`，并让媒体
+    路由按 `max(通用上限, 24MB)` 放宽；需要收缩时用 `WB_MAX_PAYLOAD_BYTES`
+    或面板 `max_payload_mb` 调小。
 
 断言分两层：类属性是「声明」，行为断言（真实 socket 上读 TCP_NODELAY、实例化
 时监听套接字 listen() 的实参）才是「声明真的生效」。最后一组用桩证明超限 body
