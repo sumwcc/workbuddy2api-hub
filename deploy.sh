@@ -1,76 +1,96 @@
 #!/usr/bin/env bash
-set -e
+# ==============================================================================
+# workbuddy2api-hub 一键发布入口（本地 -> 香港服务器，PM2 蓝绿零停机）
+# ==============================================================================
+# 本脚本只是薄封装，真正的发布流程在同级的 new-api-cf 仓库里：
+#   new-api-cf/scripts/local_deploy_hub.sh         本地：rsync 源码 + 触发远端切换
+#   new-api-cf/scripts/server_hub_blue_green_deploy.sh   服务器端：蓝绿热切换执行器
+#
+# 发布方式为 Nginx 反代 + PM2 双槽位蓝绿热切换：
+#   入口：127.0.0.1:8788（Nginx，upstream 见 /etc/nginx/snippets/upstream_hub.conf）
+#   槽位：wb-proxy-blue :8791 / wb-proxy-green :8792
+#   流程：拉起对端槽位 -> /health 探针 -> Nginx 瞬时切流 -> 旧槽 300s 长连接护航退出
+#
+# 用法:
+#   ./deploy.sh                      # 默认发 cn2 (82.158.229.151)
+#   ./deploy.sh -t node2             # 发 Node 2 (45.207.212.73)
+#   ./deploy.sh -t 1.2.3.4           # 发任意 IP
+#   NEW_API_CF_DIR=/path/to/new-api-cf ./deploy.sh -t cn2   # 自定义 new-api-cf 位置
+# ==============================================================================
 
-# ==============================================================================
-# WorkBuddy2API-Hub 一键同步部署到香港服务器脚本 (Local to Hong Kong Runner)
-# ==============================================================================
+set -euo pipefail
+
+CN2_IP="82.158.229.151"
+NODE2_IP="45.207.212.73"
+ARCHIVED_GCP_IP="34.96.166.42"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NEW_API_CF_DIR="${NEW_API_CF_DIR:-${SCRIPT_DIR}/../new-api-cf}"
 
 TARGET="cn2"
-CN2_IP="82.158.229.151"
-GCP_IP="34.96.166.42"
+
+usage() {
+  echo "用法: $0 [-t cn2|node2|<IP>]"
+  echo "  cn2    香港-CN2 Node 1  ${CN2_IP}"
+  echo "  node2  香港-CN2 Node 2  ${NODE2_IP}"
+  echo "  <IP>   任意自定义目标 IP"
+  echo "  （不传 -t 时默认 cn2；GCP ${ARCHIVED_GCP_IP} 已归档下线）"
+}
 
 while [[ $# -gt 0 ]]; do
-  case $1 in
+  case "$1" in
     -t|--target)
-      TARGET="$2"
+      TARGET="${2:-}"
       shift 2
       ;;
     -h|--help)
-      echo "用法: $0 [-t cn2|gcp]"
+      usage
       exit 0
       ;;
     *)
-      echo "未知参数: $1"
+      echo "❌ 未知参数: $1"
+      usage
       exit 1
       ;;
   esac
 done
 
-if [ "$TARGET" = "cn2" ]; then
-  SERVER_IP="$CN2_IP"
-  SERVER_NAME="香港-CN2 主节点"
-elif [ "$TARGET" = "gcp" ]; then
-  SERVER_IP="$GCP_IP"
-  SERVER_NAME="香港-GCP 辅助节点"
-else
-  echo "❌ 未知的部署目标: $TARGET (仅支持 cn2 或 gcp)"
+if [ -z "$TARGET" ]; then
+  echo "❌ -t/--target 需要一个值"
+  usage
   exit 1
 fi
 
-SERVER_USER="mwsu"
-REMOTE_PATH="/home/mwsu/workbuddy2api-hub"
+case "$TARGET" in
+  cn2|hk-cn2|node1)
+    SERVER_IP="$CN2_IP"
+    SERVER_NAME="香港-CN2 Node 1"
+    ;;
+  node2|cn2-2|slave)
+    SERVER_IP="$NODE2_IP"
+    SERVER_NAME="香港-CN2 Node 2"
+    ;;
+  gcp|hk-gcp|"$ARCHIVED_GCP_IP")
+    echo "❌ GCP 节点 ${ARCHIVED_GCP_IP} 已归档下线（账号与号池已全部并入 CN2）。"
+    echo "   现役两台请用: -t cn2（${CN2_IP}）或 -t node2（${NODE2_IP}）"
+    exit 1
+    ;;
+  *)
+    SERVER_IP="$TARGET"
+    SERVER_NAME="自定义目标"
+    ;;
+esac
+
+DEPLOY_SCRIPT="${NEW_API_CF_DIR}/scripts/local_deploy_hub.sh"
+if [ ! -f "$DEPLOY_SCRIPT" ]; then
+  echo "❌ 未找到发布脚本: ${DEPLOY_SCRIPT}"
+  echo "   请确认 new-api-cf 与本仓库同级，或用 NEW_API_CF_DIR 指定其路径。"
+  exit 1
+fi
 
 echo "========================================================"
-echo "🚀 准备同步 WorkBuddy2API-Hub 到 ${SERVER_NAME} [${SERVER_USER}@${SERVER_IP}]"
+echo "🚀 准备按蓝绿流程发布号池 (wb-proxy) 到 ${SERVER_NAME} [mwsu@${SERVER_IP}]"
+echo "   远端流程: ${DEPLOY_SCRIPT} --ip ${SERVER_IP}"
 echo "========================================================"
 
-# 1. 增量安全同步源码（严格排除核心账号、配置与统计数据）
-echo "📤 增量同步源码到服务器..."
-rsync -avz \
-  --exclude '.git/' \
-  --exclude 'accounts/*.json' \
-  --exclude 'accounts/settings.json' \
-  --exclude 'accounts/active_realm.json' \
-  --exclude 'accounts/model.json' \
-  --exclude 'accounts/agent-backups/' \
-  --exclude 'usage/' \
-  --exclude 'logs/' \
-  --exclude '__pycache__/' \
-  --exclude '*.pyc' \
-  --exclude '*.bak*' \
-  --exclude '.vscode/' \
-  --exclude '.DS_Store' \
-  ./ ${SERVER_USER}@${SERVER_IP}:${REMOTE_PATH}/
-
-# 2. 通过 SSH 平滑热重启 PM2 托管的 wb-proxy 服务
-echo "⚡ 连接远程执行 PM2 平滑重载..."
-ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_IP} "pm2 reload wb-proxy --update-env && pm2 status wb-proxy"
-
-# 3. 校验健康状态
-echo "🔍 验证远程网关健康状态..."
-HEALTH_RESP=$(ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_IP} "curl -s http://127.0.0.1:8788/health || true")
-echo "健康探测结果: $HEALTH_RESP"
-
-echo "========================================================"
-echo "✅ 部署已成功完成！Hub 网关已更新并平滑重载！"
-echo "========================================================"
+exec bash "$DEPLOY_SCRIPT" --ip "$SERVER_IP"

@@ -35,11 +35,35 @@ git push origin dev
 
 ## 服务器部署与发布规范
 
-- **运行服务器**：香港服务器 `34.96.166.42`（用户 `mwsu`）
-- **远程目录**：`/home/mwsu/workbuddy2api-hub`
-- **进程管理**：PM2 托管，服务名称为 `wb-proxy`（监听端口 `127.0.0.1:8788`）
-- **部署脚本**：项目根目录下的 `./deploy.sh`
+### 现役服务器（两台）
+
+| 节点 | IP | 用户 | 远程目录 | 状态 |
+|---|---|---|---|---|
+| Node 1（香港-CN2 主节点） | `82.158.229.151` | `mwsu` | `/home/mwsu/workbuddy2api-hub` | 在用 |
+| Node 2（香港-CN2 从节点） | `45.207.212.73` | `mwsu` | `/home/mwsu/workbuddy2api-hub` | 在用 |
+| GCP 辅助节点 | `34.96.166.42` | `mwsu` | 同上 | **已归档下线**，账号与号池已并入 CN2，不要再往它发 |
+
+### 发布架构：PM2 蓝绿双槽位 + Nginx 切流（零停机）
+
+- **Nginx 入口**：`127.0.0.1:8788`，upstream 文件 `/etc/nginx/snippets/upstream_hub.conf`（站配置 `/etc/nginx/conf.d/hub_upstream.conf`）；
+- **PM2 双槽位**：`wb-proxy-blue` 监听 `127.0.0.1:8791`，`wb-proxy-green` 监听 `127.0.0.1:8792`，启动参数 `python3 wb_proxy.py --host 127.0.0.1 --port <PORT>`；
+- **发布流程**（`new-api-cf/scripts/server_hub_blue_green_deploy.sh`）：自动判定活跃槽位 → 拉起对端槽位 → `/health` 15s 自旋探针 → Nginx 热切流（0.1s 生效）→ 旧槽 300s 长连接护航后退出；探针失败则回滚，旧槽流量不受影响；
+- **注意**：不存在名为 `wb-proxy` 的 PM2 进程，`pm2 reload wb-proxy` 一定失败，排障请用槽位名（`pm2 logs wb-proxy-blue` / `wb-proxy-green`）。
+
+### 发布命令
+
+项目根目录的 `./deploy.sh` 是薄封装，内部委托 `new-api-cf/scripts/local_deploy_hub.sh`（可用 `NEW_API_CF_DIR` 指定该仓路径）：
+
+```bash
+./deploy.sh -t cn2        # 发布 Node 1（默认，等价于不带 -t）
+./deploy.sh -t node2      # 发布 Node 2
+./deploy.sh -t <IP>       # 任意目标
+```
+
+`-t gcp` 会直接报错退出并提示改用 `-t node2`。等价底层命令：`bash ../new-api-cf/scripts/local_deploy_hub.sh --ip 82.158.229.151`。
 
 ### 部署关键约束
-1. **严格排除账号与用量敏感数据**：同步时绝不可覆盖服务器上的 `accounts/*.json`、`accounts/settings.json`、`accounts/active_realm.json`、`accounts/model.json` 及 `usage/` 目录，防止账号凭据或调用统计丢失。
-2. **平滑热重载**：通过 `pm2 reload wb-proxy` 进行零中断平滑平替重载，重启后需验证 `pm2 status wb-proxy` 与 `GET /v1/models` 健康状态。
+1. **严格排除账号与用量敏感数据**：同步时绝不可覆盖服务器上的 `accounts/`（含 `accounts/*.json`、`accounts/settings.json`、`accounts/active_realm.json`、`accounts/model.json`、`accounts/codearts/`、`accounts/agent-backups/`）、`usage/`、`logs/`，防止账号凭据或调用统计丢失。
+2. **以健康探针为准，不要手工 `pm2 restart`**：蓝绿切流已保证零中断，手工重启会打断正在进行的大模型流式长连接；发布后校验 `GET http://127.0.0.1:8788/health`（200）与一次真实 `POST /v1/chat/completions`（200）。
+3. **发布失败的回滚**：故障发生在切流前 → 旧槽未受影响，直接重试；切流后发现问题 → 对同一台再发一次（会自动切回对端槽位），或手动把 `/etc/nginx/snippets/upstream_hub.conf` 改回旧端口并 `sudo nginx -s reload`。
+4. **巡检守护**：服务器上 `cron_rotate_hub.sh` 每 15 分钟检查活跃槽位 RSS 与宿主机可用内存，超限或每日 04:30 触发一次无感轮转，勿手动删除该 crontab。
