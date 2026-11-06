@@ -3365,10 +3365,12 @@ def _remaining_refresh(state):
         log_key = _usage_log_key(path)
         if not _log_resume_ok(slot, log_key, path):
             # 文件被换掉/截短：这个来源的贡献全部作废，从零重折。
-            # 这条日志是「为什么会莫名其妙重折一遍」的线索（copytruncate 式
-            # 日志轮转、或有人在服务运行时改/换过 usage 日志）。
-            log("remaining usage fold reset (%s): usage log replaced or truncated, "
-                "folding from zero" % source)
+            # 只有「续读失败」才是线索（copytruncate 式轮转、或有人在服务
+            # 运行时改/换过日志）；冷启动时 slot["key"] 本来就是 None，那不是
+            # 事故，报了只会把真正的信号淹掉。
+            if slot.get("key") is not None:
+                log("remaining usage fold reset (%s, %s): log replaced or truncated, "
+                    "folding from zero" % (source, path), level="WARN", tag="usage")
             state[source] = {"offset": 0, "key": log_key, "tail": b""}
             if source == "log":
                 state["usage"].clear()
@@ -9704,10 +9706,13 @@ _usage_cache_retry_thread = None
 def _usage_cache_retry_min_seconds():
     """补写最低退避秒数；测试用环境变量压到毫秒级。"""
     try:
-        return max(0.0, float(os.environ.get("WB_USAGE_CACHE_RETRY_MIN_SECONDS",
-                                             _USAGE_CACHE_RETRY_MIN_SECONDS)))
+        value = float(os.environ.get("WB_USAGE_CACHE_RETRY_MIN_SECONDS",
+                                     _USAGE_CACHE_RETRY_MIN_SECONDS))
     except (TypeError, ValueError):
         return _USAGE_CACHE_RETRY_MIN_SECONDS
+    # 兜住 0（「立刻重试」的直觉写法）：0 乘任何 2**n 都是 0，退化成补写循环
+    # 的 0.5s 下限，等于每 0.5 秒写一次盘。测试用的 0.05 高于这个下限不受影响。
+    return max(0.05, value)
 
 
 def _usage_cache_schedule_retry(kind):
@@ -9729,10 +9734,39 @@ def _usage_cache_schedule_retry(kind):
     if need_thread:
         thread = threading.Thread(target=_usage_cache_retry_loop,
                                   name="usage-cache-retry", daemon=True)
+        # 先启动、成功才占位：反过来（先赋值再 start）在线程数打满 / 内存紧张
+        # 时 start() 会抛，标志位留成「非 None 的死线程」，补写线程这辈子不会
+        # 再启动，且一条日志都没有——正好复刻这次要消灭的「静默不落盘」。
+        # start() 也必须在锁外：新线程的第一件事就是抢这把锁。
+        try:
+            thread.start()
+        except Exception as exc:
+            log("usage-cache retry thread failed to start: %s: %s"
+                % (type(exc).__name__, exc), level="WARN", tag="usage")
+            return
         with _usage_cache_retry_lock:
             if _usage_cache_retry_thread is None:
                 _usage_cache_retry_thread = thread
-                thread.start()
+
+
+def _usage_cache_state_lock(kind):
+    """某一类折叠状态对应的锁；未知的类返回 None。"""
+    return {
+        "snapshot": _usage_snap_state_lock,
+        "by_account": _byacct_state_lock,
+        "analytics": _analytics_state_lock,
+        "series": _series_state_lock,
+        "remaining": _remaining_state_lock,
+    }.get(kind)
+
+
+def _usage_cache_state_busy(kind):
+    """该类的状态锁此刻是否被别人占着（只读探测，不阻塞、不获取）。"""
+    lock = _usage_cache_state_lock(kind)
+    try:
+        return bool(lock is not None and lock.locked())
+    except Exception:
+        return False
 
 
 def _usage_cache_clear_retry(kind):
@@ -9759,8 +9793,10 @@ def _usage_cache_note_skip(kind, why=None):
             _usage_cache_skip_logged[kind] = now
             count = _usage_cache_skip_counts[kind]
     if should_log:
+        # WARN 而不是默认的 INFO：这是「某类即将不落盘」的唯一信号，面板按
+        # WARN 筛问题时要能看到它。
         log("usage aggregate cache write skipped (%s, %d time(s)): %s"
-            % (kind, count, why or "state lock busy or state not serialisable"))
+            % (kind, count, why or "reason unknown"), level="WARN", tag="usage")
     _usage_cache_schedule_retry(kind)
 
 
@@ -9785,9 +9821,18 @@ def _usage_cache_retry_loop():
                 with _usage_cache_retry_lock:
                     _usage_cache_retry_due.pop(kind, None)
                 try:
-                    _usage_cache_maybe_save(kind, _usage_cache_progress.get(kind, 0))
+                    wrote = _usage_cache_maybe_save(
+                        kind, _usage_cache_progress.get(kind, 0))
                 except Exception as exc:
-                    log("usage aggregate cache retry failed (%s): %s" % (kind, exc))
+                    wrote = False
+                    log("usage aggregate cache retry failed (%s): %s: %s"
+                        % (kind, type(exc).__name__, exc),
+                        level="WARN", tag="usage")
+                if not wrote:
+                    # 没写成（写盘节流闸门把它挡回去了，或者又碰上锁被占）：
+                    # 把名额还回去，否则「跳过必补写」的承诺在推进量小的场景
+                    # 下不成立，最后一段日志会永远不落盘。
+                    _usage_cache_schedule_retry(kind)
         except Exception:
             time.sleep(5)
 
@@ -9802,6 +9847,13 @@ def _usage_cache_forget():
     with _usage_cache_lock:
         _usage_cache_kind_cache.clear()
         _usage_cache_legacy_data = _USAGE_CACHE_LEGACY_UNREAD
+    # 补写计划属于「本进程读过的状态」的一部分：不清掉会补写一份进程已经
+    # 忘了的 checkpoint（测试/探针里表现为莫名其妙的迟到写入）。
+    with _usage_cache_retry_lock:
+        _usage_cache_retry_due.clear()
+        _usage_cache_retry_attempts.clear()
+        _usage_cache_skip_logged.clear()
+        _usage_cache_skip_counts.clear()
 
 
 def _usage_cache_kind_entries(kind):
@@ -9818,15 +9870,20 @@ def _usage_cache_kind_entries(kind):
     """
     if not _usage_cache_enabled():
         return None
+    lag_message = None
     with _usage_cache_lock:
         if kind not in _usage_cache_kind_cache:
             entries = _usage_cache_read_kind(kind)
             if entries is None:
                 entries = _usage_cache_read_legacy_kind(kind)
             _usage_cache_kind_cache[kind] = entries
-            if entries:
-                _usage_cache_report_lag(kind, entries)
-        return _usage_cache_kind_cache[kind]
+            lag_message = _usage_cache_report_lag(kind, entries) if entries else None
+        result = _usage_cache_kind_cache[kind]
+    # 日志（可能落 SQLite）放到锁外：本函数可能在状态锁内被调用，不能把
+    # _usage_cache_lock 的临界区从内存操作拉长到 I/O。
+    if lag_message:
+        log(lag_message, level="WARN", tag="usage")
+    return result
 
 
 def _usage_cache_read_kind(kind):
@@ -9873,9 +9930,11 @@ def _usage_cache_report_lag(kind, entries):
         farthest = 0
         found = False
         for entry in entries:
-            offset = entry.get("offset") if isinstance(entry, dict) else None
-            if isinstance(offset, int) and offset > farthest:
-                farthest = offset
+            # _usage_cache_int() 是形状判断（返回 bool，且把 True/False 排除在外），
+            # 不是取值函数：拿它当 offset 用会把 True 当成 1，谎报落后整份日志。
+            raw = entry.get("offset") if isinstance(entry, dict) else None
+            if _usage_cache_int(raw) and raw > farthest:
+                farthest = raw
                 found = True
         if not found:
             # 这类条目里根本没有 offset（形状不认识）：报一个「落后整个日志」
@@ -9884,11 +9943,12 @@ def _usage_cache_report_lag(kind, entries):
         lag = size - farthest
         if lag < _USAGE_CACHE_LAG_WARN_BYTES:
             return
-        log("usage aggregate cache lag (%s): checkpoint %d, log %d -> %.1f MB "
-            "to fold on the next refresh" % (kind, farthest, size, lag / 1048576.0))
-    except Exception:
+        return "usage aggregate cache lag (%s): checkpoint %d, log %d -> %.1f MB " \
+               "to fold on the next refresh" % (kind, farthest, size,
+                                                lag / 1048576.0)
+    except (OSError, TypeError, ValueError, KeyError):
         # 告警自身不成立（形状不认识/stat 失败）就算了，绝不能影响读取。
-        pass
+        return None
 
 
 def _usage_cache_read_legacy_kind(kind):
@@ -11058,7 +11118,9 @@ def _usage_cache_write_kind(kind, entries):
     payload = {"schema": _USAGE_CACHE_SCHEMA, "kind": kind,
                "written_at": time.time(), "entries": entries}
     path = _usage_cache_kind_path(kind)
-    tmp = path + ".tmp"
+    # 临时文件名带 pid：蓝绿切换时新旧槽位共享同一个 usage 目录、且会同时
+    # 存活约 300 秒，固定名（path + ".tmp"）会让两个进程互相截断临时文件。
+    tmp = "%s.%d.tmp" % (path, os.getpid())
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     try:
         with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
@@ -11090,7 +11152,8 @@ def _usage_cache_maybe_save(kind, offset):
     """
     global _usage_cache_last_attempt
     if not _usage_cache_enabled():
-        return
+        return False
+    wrote = False
     try:
         # 串行化整段写盘：两个请求线程可能同时判定「该写」，而临时文件名是
         # 固定的（path + ".tmp"，和 save_runtime_override 一致），两个写者
@@ -11116,7 +11179,7 @@ def _usage_cache_maybe_save(kind, offset):
                 if not due_kinds and (not advanced
                                       or (now - _usage_cache_last_attempt)
                                       < min_seconds):
-                    return
+                    return False
                 # 记「尝试」而不是「成功」：只读文件系统上失败会一直成立，
                 # 不退避的话每次刷新都去试写一遍。
                 _usage_cache_last_attempt = now
@@ -11131,21 +11194,32 @@ def _usage_cache_maybe_save(kind, offset):
                         # 收集不到就跳过（锁被占 / 状态不可序列化）是设计，但
                         # 必须留痕并登记补写：静默跳过会让某一类连续几天不落盘
                         # ———现场只有 CPU 高，重启后又从旧 offset 全量重折。
-                        _usage_cache_note_skip(advanced_kind)
+                        # 两种原因要能分开：锁被占补写能自愈，「状态不可序列化」
+                        # 补写永远治不好，排障方向完全不同。
+                        _usage_cache_note_skip(
+                            advanced_kind,
+                            "state lock busy" if _usage_cache_state_busy(advanced_kind)
+                            else "state not serialisable (kind state has no "
+                                 "checkpointable shape yet)")
                         continue
                     entries, done = collected
                     _usage_cache_write_kind(advanced_kind, entries)
                 except Exception as exc:
-                    log("usage aggregate cache write failed (%s): %s"
-                        % (advanced_kind, exc))
-                    _usage_cache_note_skip(advanced_kind, why=exc)
+                    log("usage aggregate cache write failed (%s): %s: %s"
+                        % (advanced_kind, type(exc).__name__, exc),
+                        level="WARN", tag="usage")
+                    _usage_cache_note_skip(
+                        advanced_kind, why=type(exc).__name__ + ": " + str(exc))
                     continue
                 _usage_cache_clear_retry(advanced_kind)
+                wrote = True
                 with _usage_cache_lock:
                     if done > _usage_cache_checkpointed.get(advanced_kind, 0):
                         _usage_cache_checkpointed[advanced_kind] = done
     except Exception as exc:
-        log("usage aggregate cache write failed: %s" % exc)
+        log("usage aggregate cache write failed: %s: %s"
+            % (type(exc).__name__, exc), level="WARN", tag="usage")
+    return wrote
 
 
 def runtime_settings_view():
