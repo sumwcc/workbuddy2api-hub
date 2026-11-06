@@ -211,7 +211,43 @@ P._remaining_refresh(stale_state)
 check("续读失败告警",
       len([m for m in LOGS if "replaced or truncated" in m]) >= 1, LOGS)
 
-print("[7] checkpoint 落后日志很多时要告警，落后少/形状不认识时闭嘴")
+print("[7] 补写没写成时归还名额：闸门挡回要重登记，已登记的不重复登记")
+clear_all()
+with P._usage_cache_retry_lock:
+    P._usage_cache_retry_due.clear()
+    P._usage_cache_retry_attempts.clear()
+P._usage_cache_requeue_if_needed("remaining", True)
+check("写成了不留名额", not skip_retry_for(), P._usage_cache_retry_due)
+P._usage_cache_requeue_if_needed("remaining", False)
+check("没写成（闸门挡回）要重登记", skip_retry_for(), P._usage_cache_retry_due)
+attempts_before = attempts_for()
+P._usage_cache_requeue_if_needed("remaining", False)
+check("已登记时不重复登记（避免退避翻倍）",
+      attempts_for() == attempts_before, (attempts_before, attempts_for()))
+clear_all()
+
+print("[8] 状态不可序列化：原因要如实上报（不是一律说成锁被占）")
+del LOGS[:]
+P._remaining_state.update({
+    "events": [], "usage": {}, "keys": set(), "day": "",
+    "log": {"offset": OFFSET, "key": P._usage_log_key(), "tail": None},   # 形状坏了
+    "file": {"offset": 0, "key": None, "tail": b""},
+})
+with P._usage_cache_lock:
+    P._usage_cache_progress["remaining"] = OFFSET
+    P._usage_cache_checkpointed.pop("remaining", None)
+    P._usage_cache_last_attempt = 0.0
+returned = P._usage_cache_maybe_save("remaining", OFFSET)
+check("形状坏了不写盘", returned is False, returned)
+check("收集失败时记下了真实原因（形如 state not serialisable）",
+      P._usage_cache_collect_reason.get("remaining", "").startswith("state not serialisable"),
+      P._usage_cache_collect_reason)
+check("日志里是「不可序列化」而不是「锁被占」",
+      any("not serialisable" in m for m in LOGS)
+      and not any("state lock busy" in m for m in LOGS), LOGS)
+clear_all()
+
+print("[9] checkpoint 落后日志很多时要告警，落后少/形状不认识时闭嘴")
 del LOGS[:]
 _real_log_key = P._usage_log_key
 P._usage_log_key = lambda path=None: (200 * 1024 * 1024, 1, 1)   # 假装日志 200MB

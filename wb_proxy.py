@@ -3368,7 +3368,9 @@ def _remaining_refresh(state):
             # 只有「续读失败」才是线索（copytruncate 式轮转、或有人在服务
             # 运行时改/换过日志）；冷启动时 slot["key"] 本来就是 None，那不是
             # 事故，报了只会把真正的信号淹掉。
-            if slot.get("key") is not None:
+            folded_before = (slot.get("key") not in (None, (0, 0, 0))
+                             and (slot.get("offset") or 0) > 0)
+            if folded_before:
                 log("remaining usage fold reset (%s, %s): log replaced or truncated, "
                     "folding from zero" % (source, path), level="WARN", tag="usage")
             state[source] = {"offset": 0, "key": log_key, "tail": b""}
@@ -9701,6 +9703,7 @@ _usage_cache_retry_attempts = {}
 _usage_cache_skip_logged = {}
 _usage_cache_skip_counts = {}
 _usage_cache_retry_thread = None
+_usage_cache_retry_starting = False
 
 
 def _usage_cache_retry_min_seconds():
@@ -9711,8 +9714,8 @@ def _usage_cache_retry_min_seconds():
     except (TypeError, ValueError):
         return _USAGE_CACHE_RETRY_MIN_SECONDS
     # 兜住 0（「立刻重试」的直觉写法）：0 乘任何 2**n 都是 0，退化成补写循环
-    # 的 0.5s 下限，等于每 0.5 秒写一次盘。测试用的 0.05 高于这个下限不受影响。
-    return max(0.05, value)
+    # 的 0.5s 粒度，等于每 0.5 秒试写一次盘。
+    return max(1.0, value)
 
 
 def _usage_cache_schedule_retry(kind):
@@ -9721,7 +9724,7 @@ def _usage_cache_schedule_retry(kind):
     只提前不延后：同一个类被反复跳过时取更早的那个 deadline，退避由
     attempts 计数决定（每次登记 +1，封顶 15 分钟）。
     """
-    global _usage_cache_retry_thread
+    global _usage_cache_retry_thread, _usage_cache_retry_starting
     with _usage_cache_retry_lock:
         attempts = _usage_cache_retry_attempts.get(kind, 0)
         delay = min(_usage_cache_retry_min_seconds() * (2 ** min(attempts, 5)),
@@ -9730,7 +9733,10 @@ def _usage_cache_schedule_retry(kind):
         due = time.time() + delay
         current = _usage_cache_retry_due.get(kind)
         _usage_cache_retry_due[kind] = due if current is None else min(current, due)
-        need_thread = _usage_cache_retry_thread is None
+        need_thread = (_usage_cache_retry_thread is None
+                       and not _usage_cache_retry_starting)
+        if need_thread:
+            _usage_cache_retry_starting = True
     if need_thread:
         thread = threading.Thread(target=_usage_cache_retry_loop,
                                   name="usage-cache-retry", daemon=True)
@@ -9741,32 +9747,27 @@ def _usage_cache_schedule_retry(kind):
         try:
             thread.start()
         except Exception as exc:
+            with _usage_cache_retry_lock:
+                _usage_cache_retry_starting = False
             log("usage-cache retry thread failed to start: %s: %s"
                 % (type(exc).__name__, exc), level="WARN", tag="usage")
             return
         with _usage_cache_retry_lock:
-            if _usage_cache_retry_thread is None:
-                _usage_cache_retry_thread = thread
+            _usage_cache_retry_thread = thread
+            _usage_cache_retry_starting = False
 
 
-def _usage_cache_state_lock(kind):
-    """某一类折叠状态对应的锁；未知的类返回 None。"""
-    return {
-        "snapshot": _usage_snap_state_lock,
-        "by_account": _byacct_state_lock,
-        "analytics": _analytics_state_lock,
-        "series": _series_state_lock,
-        "remaining": _remaining_state_lock,
-    }.get(kind)
+# 每一类上一次「收集不到」的真实原因，由 _usage_cache_collect_kind 自己写下：
+# 事后复探锁状态不准（它失败时本来就没拿到锁，等调用方来问时持有者可能已经
+# 放手），会把瞬时的锁竞争误判成「状态不可序列化」。
+_USAGE_CACHE_BUSY = "state lock busy"
+_USAGE_CACHE_UNSERIALISABLE = "state not serialisable (kind state has no checkpointable shape)"
+_usage_cache_collect_reason = {}
 
 
-def _usage_cache_state_busy(kind):
-    """该类的状态锁此刻是否被别人占着（只读探测，不阻塞、不获取）。"""
-    lock = _usage_cache_state_lock(kind)
-    try:
-        return bool(lock is not None and lock.locked())
-    except Exception:
-        return False
+def _usage_cache_mark_reason(kind, reason):
+    _usage_cache_collect_reason[kind] = reason
+    return None
 
 
 def _usage_cache_clear_retry(kind):
@@ -9797,7 +9798,27 @@ def _usage_cache_note_skip(kind, why=None):
         # WARN 筛问题时要能看到它。
         log("usage aggregate cache write skipped (%s, %d time(s)): %s"
             % (kind, count, why or "reason unknown"), level="WARN", tag="usage")
+    if why and why.startswith(_USAGE_CACHE_UNSERIALISABLE[:30]) and count >= 3:
+        # 形状不可序列化不是补写能治的（状态要等下一次折叠成功才有可写的
+        # 形状）：再无限重试只是每 15 分钟白试一次 + 每 300s 一条 WARN。
+        # 留痕到此为止，下一次真正折叠成功时会走 clear_retry 复位。
+        return
     _usage_cache_schedule_retry(kind)
+
+
+def _usage_cache_requeue_if_needed(kind, wrote):
+    """补写没写成时把名额还回去（写成了就什么都不做）。
+
+    写盘节流闸门挡回去的那次没人在别处登记 → 必须归还，否则「跳过必补写」在
+    推进量小的场景下不成立（最后一段日志永远不落盘）。跳过路径（note_skip）
+    已经登记过，再登记一次会让退避和计数按 2 倍增长，所以先看有没有待办。
+    """
+    if wrote:
+        return
+    with _usage_cache_retry_lock:
+        already = kind in _usage_cache_retry_due
+    if not already:
+        _usage_cache_schedule_retry(kind)
 
 
 def _usage_cache_retry_loop():
@@ -9828,12 +9849,12 @@ def _usage_cache_retry_loop():
                     log("usage aggregate cache retry failed (%s): %s: %s"
                         % (kind, type(exc).__name__, exc),
                         level="WARN", tag="usage")
-                if not wrote:
-                    # 没写成（写盘节流闸门把它挡回去了，或者又碰上锁被占）：
-                    # 把名额还回去，否则「跳过必补写」的承诺在推进量小的场景
-                    # 下不成立，最后一段日志会永远不落盘。
-                    _usage_cache_schedule_retry(kind)
-        except Exception:
+                _usage_cache_requeue_if_needed(kind, wrote)
+        except Exception as exc:
+            # 这里是最后一道兜底：不留痕就等于把「补写名额」悄悄吃掉，和内层
+            # 静默跳过是同一种事故形态（本次修复要消灭的正是它）。
+            log("usage-cache retry loop hiccup: %s: %s"
+                % (type(exc).__name__, exc), level="WARN", tag="usage")
             time.sleep(5)
 
 
@@ -9871,13 +9892,15 @@ def _usage_cache_kind_entries(kind):
     if not _usage_cache_enabled():
         return None
     lag_message = None
+    log_size = _usage_log_key()[0]      # 锁外 stat，供 lag 告警使用
     with _usage_cache_lock:
         if kind not in _usage_cache_kind_cache:
             entries = _usage_cache_read_kind(kind)
             if entries is None:
                 entries = _usage_cache_read_legacy_kind(kind)
             _usage_cache_kind_cache[kind] = entries
-            lag_message = _usage_cache_report_lag(kind, entries) if entries else None
+            lag_message = (_usage_cache_report_lag(kind, entries, log_size=log_size)
+                           if entries else None)
         result = _usage_cache_kind_cache[kind]
     # 日志（可能落 SQLite）放到锁外：本函数可能在状态锁内被调用，不能把
     # _usage_cache_lock 的临界区从内存操作拉长到 I/O。
@@ -9918,7 +9941,7 @@ def _usage_cache_read_kind(kind):
     return entries
 
 
-def _usage_cache_report_lag(kind, entries):
+def _usage_cache_report_lag(kind, entries, log_size=None):
     """加载到的 checkpoint 落后当前日志很多时，留一条日志。
 
     offset 落后多少，重启后第一批请求就要重折多少字节——「早上/发版后面板
@@ -9926,7 +9949,9 @@ def _usage_cache_report_lag(kind, entries):
     永远合法），只是要看得见。每类每次进程只报一次（读取结果按类记忆）。
     """
     try:
-        size = _usage_log_key()[0]
+        # 调用点可以在锁外先 stat 好再传进来：本函数可能被 _usage_cache_lock
+        # 保护着调用，不该在临界区里再发一次 syscall。
+        size = log_size if log_size is not None else _usage_log_key()[0]
         farthest = 0
         found = False
         for entry in entries:
@@ -11039,52 +11064,55 @@ def _usage_cache_collect_kind(kind):
         done = 0
         with _lock_if_free(_usage_snap_state_lock) as held:
             if not held:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             for realm, state in _usage_snap_state.items():
                 entry = _usage_cache_snapshot_entry(realm, state)
                 if entry is not None:
                     entries.append(entry)
                     done = max(done, state["offset"])
-        return (entries, done) if entries else None
+        return (entries, done) if entries else _usage_cache_mark_reason(
+            kind, _USAGE_CACHE_UNSERIALISABLE)
     if kind == "by_account":
         with _lock_if_free(_byacct_state_lock) as held:
             if not held:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             entry = _usage_cache_by_account_entry(_byacct_state)
             if entry is None:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_UNSERIALISABLE)
             return [entry], _byacct_state["offset"]
     if kind == "analytics":
         entries = []
         done = 0
         with _lock_if_free(_analytics_state_lock) as held:
             if not held:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             for realm, state in _analytics_state.items():
                 entry = _usage_cache_analytics_entry(realm, state)
                 if entry is not None:
                     entries.append(entry)
                     done = max(done, state["offset"])
-        return (entries, done) if entries else None
+        return (entries, done) if entries else _usage_cache_mark_reason(
+            kind, _USAGE_CACHE_UNSERIALISABLE)
     if kind == "series":
         entries = []
         done = 0
         with _lock_if_free(_series_state_lock) as held:
             if not held:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             for realm, state in _series_state.items():
                 entry = _usage_cache_series_entry(realm, state)
                 if entry is not None:
                     entries.append(entry)
                     done = max(done, state["offset"])
-        return (entries, done) if entries else None
+        return (entries, done) if entries else _usage_cache_mark_reason(
+            kind, _USAGE_CACHE_UNSERIALISABLE)
     if kind == "remaining":
         with _lock_if_free(_remaining_state_lock) as held:
             if not held:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             entry = _usage_cache_remaining_entry(_remaining_state)
             if entry is None:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_UNSERIALISABLE)
             return [entry], entry["offset"]
     return None
 
@@ -11155,9 +11183,9 @@ def _usage_cache_maybe_save(kind, offset):
         return False
     wrote = False
     try:
-        # 串行化整段写盘：两个请求线程可能同时判定「该写」，而临时文件名是
-        # 固定的（path + ".tmp"，和 save_runtime_override 一致），两个写者
-        # 同时打开同一个临时文件会互相截断。等锁的一方在锁里会重新判定一遍，
+        # 串行化整段写盘：两个请求线程可能同时判定「该写」。临时文件名虽然已
+        # 按 pid 区分（见 _usage_cache_write_kind），但同进程的两个写者仍会撞
+        # 同一个临时文件，所以写盘整体串行。等锁的一方在锁里会重新判定一遍，
         # 第一个写者已经把 checkpointed 推上去，于是它多半直接返回。
         with _usage_cache_write_lock:
             now = time.time()
@@ -11198,9 +11226,8 @@ def _usage_cache_maybe_save(kind, offset):
                         # 补写永远治不好，排障方向完全不同。
                         _usage_cache_note_skip(
                             advanced_kind,
-                            "state lock busy" if _usage_cache_state_busy(advanced_kind)
-                            else "state not serialisable (kind state has no "
-                                 "checkpointable shape yet)")
+                            _usage_cache_collect_reason.get(advanced_kind)
+                            or _USAGE_CACHE_BUSY)
                         continue
                     entries, done = collected
                     _usage_cache_write_kind(advanced_kind, entries)
