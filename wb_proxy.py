@@ -3365,6 +3365,10 @@ def _remaining_refresh(state):
         log_key = _usage_log_key(path)
         if not _log_resume_ok(slot, log_key, path):
             # 文件被换掉/截短：这个来源的贡献全部作废，从零重折。
+            # 这条日志是「为什么会莫名其妙重折一遍」的线索（copytruncate 式
+            # 日志轮转、或有人在服务运行时改/换过 usage 日志）。
+            log("remaining usage fold reset (%s): usage log replaced or truncated, "
+                "folding from zero" % source)
             state[source] = {"offset": 0, "key": log_key, "tail": b""}
             if source == "log":
                 state["usage"].clear()
@@ -9679,6 +9683,114 @@ _usage_cache_progress = {}
 _usage_cache_checkpointed = {}
 _usage_cache_last_attempt = time.time()
 
+# 补写（retry）状态：某一类这次被跳过（状态锁被占 / 状态不可序列化）时不能
+# 就这么算了 —— 实践中见过一类连续几天没落盘：现场只有 CPU 高，没有任何日志，
+# 重启后又从旧 offset 全量重折。登记一个延迟重试，成功就取消。
+# 退避：30s 起步、指数翻倍、封顶 15 分钟，成功立刻归零。
+_USAGE_CACHE_RETRY_MIN_SECONDS = 30.0
+_USAGE_CACHE_RETRY_MAX_SECONDS = 900.0
+_USAGE_CACHE_SKIP_LOG_SECONDS = 300.0
+# 加载到的 checkpoint 落后当前日志超过这么多字节就告警：它就是「重启后第一批
+# 请求又慢了几分钟」的那个数。
+_USAGE_CACHE_LAG_WARN_BYTES = 64 * 1024 * 1024
+_usage_cache_retry_lock = threading.Lock()
+_usage_cache_retry_due = {}
+_usage_cache_retry_attempts = {}
+_usage_cache_skip_logged = {}
+_usage_cache_skip_counts = {}
+_usage_cache_retry_thread = None
+
+
+def _usage_cache_retry_min_seconds():
+    """补写最低退避秒数；测试用环境变量压到毫秒级。"""
+    try:
+        return max(0.0, float(os.environ.get("WB_USAGE_CACHE_RETRY_MIN_SECONDS",
+                                             _USAGE_CACHE_RETRY_MIN_SECONDS)))
+    except (TypeError, ValueError):
+        return _USAGE_CACHE_RETRY_MIN_SECONDS
+
+
+def _usage_cache_schedule_retry(kind):
+    """登记一次延迟补写：跳过的类必须有人接着写，否则永远停在旧 offset 上。
+
+    只提前不延后：同一个类被反复跳过时取更早的那个 deadline，退避由
+    attempts 计数决定（每次登记 +1，封顶 15 分钟）。
+    """
+    global _usage_cache_retry_thread
+    with _usage_cache_retry_lock:
+        attempts = _usage_cache_retry_attempts.get(kind, 0)
+        delay = min(_usage_cache_retry_min_seconds() * (2 ** min(attempts, 5)),
+                    _USAGE_CACHE_RETRY_MAX_SECONDS)
+        _usage_cache_retry_attempts[kind] = attempts + 1
+        due = time.time() + delay
+        current = _usage_cache_retry_due.get(kind)
+        _usage_cache_retry_due[kind] = due if current is None else min(current, due)
+        need_thread = _usage_cache_retry_thread is None
+    if need_thread:
+        thread = threading.Thread(target=_usage_cache_retry_loop,
+                                  name="usage-cache-retry", daemon=True)
+        with _usage_cache_retry_lock:
+            if _usage_cache_retry_thread is None:
+                _usage_cache_retry_thread = thread
+                thread.start()
+
+
+def _usage_cache_clear_retry(kind):
+    """该类已写成功：取消补写并清掉跳过计数/日志节流。"""
+    with _usage_cache_retry_lock:
+        _usage_cache_retry_due.pop(kind, None)
+        _usage_cache_retry_attempts.pop(kind, None)
+        _usage_cache_skip_logged.pop(kind, None)
+        _usage_cache_skip_counts.pop(kind, None)
+
+
+def _usage_cache_note_skip(kind, why=None):
+    """记一次跳过的写盘：留痕（节流）+ 登记补写。
+
+    跳过本身是设计（不能在请求线程里阻塞等状态锁），但静默跳过会让一类
+    连续几天不落盘而现场毫无线索，所以这里必须打日志。
+    """
+    now = time.time()
+    with _usage_cache_retry_lock:
+        _usage_cache_skip_counts[kind] = _usage_cache_skip_counts.get(kind, 0) + 1
+        last = _usage_cache_skip_logged.get(kind)
+        should_log = last is None or (now - last) >= _USAGE_CACHE_SKIP_LOG_SECONDS
+        if should_log:
+            _usage_cache_skip_logged[kind] = now
+            count = _usage_cache_skip_counts[kind]
+    if should_log:
+        log("usage aggregate cache write skipped (%s, %d time(s)): %s"
+            % (kind, count, why or "state lock busy or state not serialisable"))
+    _usage_cache_schedule_retry(kind)
+
+
+def _usage_cache_retry_loop():
+    """后台补写：到点就把跳过的类重新走一遍 _usage_cache_maybe_save。
+
+    永远不抛异常：这是个加速件的看守，它自己挂掉不能影响服务。
+    """
+    while True:
+        try:
+            now = time.time()
+            with _usage_cache_retry_lock:
+                due = [k for k, ts in _usage_cache_retry_due.items() if ts <= now]
+                wait = 60.0
+                if _usage_cache_retry_due:
+                    wait = max(0.5, min(60.0,
+                                       min(_usage_cache_retry_due.values()) - now))
+            if not due:
+                time.sleep(wait)
+                continue
+            for kind in due:
+                with _usage_cache_retry_lock:
+                    _usage_cache_retry_due.pop(kind, None)
+                try:
+                    _usage_cache_maybe_save(kind, _usage_cache_progress.get(kind, 0))
+                except Exception as exc:
+                    log("usage aggregate cache retry failed (%s): %s" % (kind, exc))
+        except Exception:
+            time.sleep(5)
+
 
 def _usage_cache_forget():
     """忘掉本进程读过的 checkpoint（模拟一次重启；测试与探针用）。
@@ -9712,6 +9824,8 @@ def _usage_cache_kind_entries(kind):
             if entries is None:
                 entries = _usage_cache_read_legacy_kind(kind)
             _usage_cache_kind_cache[kind] = entries
+            if entries:
+                _usage_cache_report_lag(kind, entries)
         return _usage_cache_kind_cache[kind]
 
 
@@ -9745,6 +9859,36 @@ def _usage_cache_read_kind(kind):
     if not isinstance(entries, list):
         return None
     return entries
+
+
+def _usage_cache_report_lag(kind, entries):
+    """加载到的 checkpoint 落后当前日志很多时，留一条日志。
+
+    offset 落后多少，重启后第一批请求就要重折多少字节——「早上/发版后面板
+    特别卡、CPU 跑满」的那个数就是它。落后本身不报错（append-only 日志下
+    永远合法），只是要看得见。每类每次进程只报一次（读取结果按类记忆）。
+    """
+    try:
+        size = _usage_log_key()[0]
+        farthest = 0
+        found = False
+        for entry in entries:
+            offset = entry.get("offset") if isinstance(entry, dict) else None
+            if isinstance(offset, int) and offset > farthest:
+                farthest = offset
+                found = True
+        if not found:
+            # 这类条目里根本没有 offset（形状不认识）：报一个「落后整个日志」
+            # 只会误导人，宁可不说。
+            return
+        lag = size - farthest
+        if lag < _USAGE_CACHE_LAG_WARN_BYTES:
+            return
+        log("usage aggregate cache lag (%s): checkpoint %d, log %d -> %.1f MB "
+            "to fold on the next refresh" % (kind, farthest, size, lag / 1048576.0))
+    except Exception:
+        # 告警自身不成立（形状不认识/stat 失败）就算了，绝不能影响读取。
+        pass
 
 
 def _usage_cache_read_legacy_kind(kind):
@@ -10984,13 +11128,19 @@ def _usage_cache_maybe_save(kind, offset):
                 try:
                     collected = _usage_cache_collect_kind(advanced_kind)
                     if collected is None:
+                        # 收集不到就跳过（锁被占 / 状态不可序列化）是设计，但
+                        # 必须留痕并登记补写：静默跳过会让某一类连续几天不落盘
+                        # ———现场只有 CPU 高，重启后又从旧 offset 全量重折。
+                        _usage_cache_note_skip(advanced_kind)
                         continue
                     entries, done = collected
                     _usage_cache_write_kind(advanced_kind, entries)
                 except Exception as exc:
                     log("usage aggregate cache write failed (%s): %s"
                         % (advanced_kind, exc))
+                    _usage_cache_note_skip(advanced_kind, why=exc)
                     continue
+                _usage_cache_clear_retry(advanced_kind)
                 with _usage_cache_lock:
                     if done > _usage_cache_checkpointed.get(advanced_kind, 0):
                         _usage_cache_checkpointed[advanced_kind] = done
