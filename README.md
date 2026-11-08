@@ -1,14 +1,9 @@
 # WorkBuddy2API-Hub — 国际版、国内版多账号网关中枢
 
-> [!CAUTION]
-> **项目停止维护（2026-11-06）**：后续不再更新代码、不跟进上游变化、不再处理新的 issue / PR。感谢大家的 star。
-
 > [!IMPORTANT]
-> **项目进入低频维护（2026-10-23） / Low-frequency maintenance**
+> **官方群聊**：[https://t.me/wb2apihub](https://t.me/wb2apihub)
 >
-> 大幅降低更新频率与 Issue / PR 处理速度。请先阅读风险说明，再决定是否继续使用。
->
-> Updates and responses to issues / pull requests will be significantly reduced. Read the risk notice below before continuing.
+> **凭证安全**：本项目是本地部署网关，运行时需要在本地读取用户自行导入的账号凭证，才能调用官方接口；凭证保存在用户自己的 `accounts/` 目录。项目不会把凭证上传到本项目的第三方服务器，也没有隐藏的凭证收集或上传逻辑。请立即关闭公网暴露，联系官方吊销全部 OAuth / 设备授权，确认旧 token 返回 `401` 后再重新授权。
 
 > [!WARNING]
 > **WorkBuddy 上游正在收紧对非官方客户端的识别与拦截。**
@@ -25,12 +20,12 @@
 This project is for protocol research and personal use only. Prefer the official client, do not use your primary account, and do not resell or share access.
 
 <p align="center">
-  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v2.0.0-2496ED?style=flat-square" alt="Version 2.0.0"></a>
+  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v2.0.1-2496ED?style=flat-square" alt="Version 2.0.1"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
   <img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/Maintenance-Ended-9f2d2d?style=flat-square" alt="Maintenance ended">
+  <img src="https://img.shields.io/badge/Maintenance-Resumed-0DBD8B?style=flat-square" alt="Maintenance resumed">
 </p>
 
 ## 核心特性
@@ -253,7 +248,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 274 个套件：207 个 Python + 67 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 281 个套件：212 个 Python + 69 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -263,6 +258,19 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 
 ### Unreleased
 
+- 新增可选的订阅桥接（#830）：把 Clash / Mihomo 订阅、V2Ray URI 或单个 HTTP / SOCKS 代理转换成 mihomo listener，并同步成网关代理槽。direct 代理现在会正确生成 `proxies` 条目；HTTP 订阅与 HTTP 代理可以区分；缺失 PyYAML 时会返回明确错误。Docker 与宿主 mihomo 的联动仍需按 `docs/SUBBRIDGE.md` 挂载配置。
+- 新增 `start-workbuddy-all.bat`：一条命令先通过 `--probe-only` 确认端口上是健康的本项目实例，未运行时再拉起代理，随后打开 WorkBuddy 执行器工作台窗口。端口被陌生服务或卡死实例占用时会直接报错，不再误判为“已在运行”。网关目录、Node、Python 可用 `WORKBUDDY_GATEWAY_DIR` / `WORKBUDDY_NODE` / `WORKBUDDY_PYTHON` 覆盖，端口用第一个参数指定（默认 8788）；`WORKBUDDY_LAUNCH_SKIP_WINDOW=1` 只起代理不开窗口。
+- **Responses 历史推理保真 / Responses reasoning replay fidelity**：修复连续 `reasoning` 项目只剩最后一段、相邻两轮助手消息被合并、Chat 形状助手历史里的 `reasoning_content` 被丢弃，以及内置 web 工具第二轮请求丢失第一轮推理的问题；推理只关联所属助手消息，不会写入 user/system/tool 普通文本，也不会猜测或改写外部提供者的加密 `encrypted_content`。保真只证明历史按原样送达 WorkBuddy Chat 上游，不额外保证模型的长期任务质量。 / Fix consecutive reasoning replay overwrites, adjacent assistant-turn collapse, Chat-shaped `reasoning_content` loss, and reasoning loss across built-in web-tool follow-ups. Reasoning stays attached to its assistant message, never enters user/system/tool text, and foreign encrypted content is never guessed or rewritten. Preservation proves delivery to the WorkBuddy Chat upstream only, not long-task model quality.
+- **API Key 的出口徽章与模型准入覆盖 CodeArts 出口**（#801 / #802）：绑定固定 CodeArts 出口的 Key 在列表里被画成「跟随面板切换」（图标分支只认 `intl` / `cn`），现在出口徽章统一走 `keyRealmBadge()`，三种出口各回各的；「模型准入」的候选清单也补上 `?realm=codearts`（它的 13 个模型与 intl / cn 完全不交集，以前一个都选不到、只能手填 id），绑定了出口的 Key 只列该出口的目录并在清单上方标出出口，未绑定（跟随面板切换）的才取全量；清单按出口分别缓存，不再由先打开的 Key 决定后面所有 Key 的清单。CodeArts 未启用时不去请求该目录。
+- **手机端账号卡的长昵称不再顶出卡片**：账号名那格的直接子项原来按内容宽排（`min-width:auto`），昵称一长就把整格撑到卡片外面——390px 视口实测单元格内容宽 271px、名字行 434px，右侧被硬裁且没有省略号。现在该格的直接子项钉住 `min-width:0;max-width:100%`，长昵称按格宽省略。
+- **手机端账号区三处布局修正**：批量操作那组 6 个按钮一行摆不下时会被压成竖排单字，窄屏改为两列网格（3 行 2 列），文字保持横排；账号卡第一行原来塞了昵称、备注、分组、任务开关、版本、状态、账户类型，长昵称时整行顶出卡片，现在任务开关与版本 / 状态 / 类型收到第二行单独显示；操作区两层 flex 容器各自换行时「出站身份」会整块另起一行、中间空出一段，两行容器改为 `display:contents` 拆平，按钮按顺序自然流动（「导出」紧跟「同步昵称」，「删除」排在出站身份之后）。以上都只在 ≤640px 生效，桌面布局不变。
+- **请求到达即记日志（`chat head`）**：聊天日志行要等请求体收完才写，上传慢的请求在那段窗口里一行痕迹都没有，看起来像「对话卡住」，也分不清「上传慢」与「请求没到本进程」。现在 `do_POST` 在模型路由的请求头到达时先记一条 `chat head`（带 `content_length` 与 key），配合 `body_wait` 能直接区分两者。只覆盖对话真正使用的路由，面板轮询不刷日志。
+- **`responses:` 日志同时打客户端与实际生效的推理强度**：原来只打请求体里的 `effort`，客户端不填时恒为 `None`，读起来像「没开思考」，实际按模型默认档（如 `high`）在跑。现在同时打 `effort=`（客户端）与 `upstream_effort=`（实际写进上游请求的值），两者用与构造请求体同一份解析逻辑。
+- **自绘下拉面板不再被祖先裁剪、移动端出口/权重格不再互相挤压**：`.cs-panel` 从 `position:absolute` 改为 `position:fixed`，打开 / 滚动 / 缩放时把触发器坐标与最小宽度写进内联样式，向上展开的下拉不会再被账号卡区块的 `overflow-y:auto` 裁掉首行。出口 / 权重两格在移动端改用 `flex:1 1 0` 占剩余宽度，长节点名不再溢出盖住「权重：」标签。
+- **400 / 未处理 4xx 不再泄漏账号并发名额**：上游 400（如 11-128 渠道校验）原样透传时直接 `raise`，跳过了重试循环后的统一归还，账号在 `account_max_concurrent` 计数里永久 +1。上限为 1 时一个漏掉的名额就让它永远「已在服务 1 个请求」——面板健康、账号测试也绿，但派发再也不选它，只有重启进程才恢复。其它未单独处理的 4xx（如打错路径的 404）走同一个 `raise`，问题相同。现在两处 `raise` 之前都先归还名额。
+- **网关重启后账号列表不再被旧筛选过滤成空**：账号筛选（搜索词 / 状态 / 分组）是内存态，而网关重启后会话失效、重新登录不会刷新页面，重启前设的条件会原样留到登录后，把账号列表过滤成空——「当前禁用」区用的是未筛选名单，反而还显示账号，看起来像账号全丢了，必须手动点「清除筛选」才恢复。现在会话丢失与每次进入面板都会重置账号筛选，以「显示全部账号」为默认。
+- **账号表「权重」列不再只剩一个箭头**：64px 的列宽减去单元格内边距只剩 40px，自绘下拉的触发器要吃掉 padding 18px + gap 8px + 箭头 11px，数字被挤成 1px 宽。现在列宽放宽到 78px、该列内边距收到 8px，并给权重下拉单独的紧凑触发器，1–3 位数都留得下。
+- **国际版 DeepSeek 出站别名**：客户端和 `/v1/models` 继续显示 `deepseek-v4.1-flash`（同时保留显式 `-sg`），实际发给国际版上游时使用 `deepseek-v4.1-flash-sg`；API Key 模型白名单仍按 base 校验，响应与用量记录保留 `requested_model=deepseek-v4.1-flash`，实际计费模型记为 `-sg`。面板账号测试、每日活跃与窗口探针也走真实 `-sg`。`WB_INTL_MODEL_ALIAS=0` 可关闭映射。出站桌面身份同步到 5.9.4（UA `WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0`）。
 - **用量聚合缓存跳过写盘时不再静默停更**：checkpoint 写盘因状态锁被占、状态暂不可序列化或写入异常而跳过时，按类节流告警并登记后台异步补写（30 秒起指数退避，封顶 15 分钟）；补写成功立即取消，失败继续重试。新增 64MB checkpoint 落后告警、蓝绿双进程临时文件隔离，避免 `remaining` 一类缓存连续多日不落盘、重启后反复全量重折。
 - **设置页分组在正體中文 / 英文界面不再整页空白**：分组胶囊靠各区块的 `h2` 标题文字比对归类，界面语言切到正體中文或英文后标题已被 i18n 换掉，比对全部落空、每个区块都归到「日志与系统」，于是点「基础 / 自动化 / 稳定性」时把整页 section 全部 hidden（看起来设置页清空）。现在改用 i18n 翻译前保留的原文比对，三种语言的分组结果一致；另补上漏归的「选择网页活跃提示词」（原来被归到「日志与系统」）。
 - **账号分组**（#707）：账号新增可选分组，支持按组筛选、导入时指定分组、单账号编辑、分组启停，以及刷新凭证 / 测试 / 补积分等批量操作仅作用于当前分组；API Key 账号选择器也支持按组选入与移除。

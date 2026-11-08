@@ -32,6 +32,7 @@ ops/aliyun/workbuddy2api-hub-updater.conf
 ops/aliyun/workbuddy2api-hub-updater-app.conf
 
 start-wb-proxy.bat
+start-workbuddy-all.bat
 start-wb-proxy-visible.bat
 start-wb-proxy.command
 start-wb-proxy.sh
@@ -85,3 +86,4 @@ wb_webagent.py
 wb_webprompts.py
 wb_webtools.py
 wb_window_probe.py
+wb_subbridge.py

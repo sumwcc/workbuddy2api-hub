@@ -1,3 +1,11 @@
+## v2.0.1
+
+- **国际版 DeepSeek 出站别名**：客户端与 `/v1/models` 继续展示 `deepseek-v4.1-flash`，实际发给国际版上游时使用 `deepseek-v4.1-flash-sg`；显式请求 `-sg` 保持原样，API Key 模型白名单仍按 base 校验，响应与用量记录保留逻辑模型，实际计费模型单独记录。`WB_INTL_MODEL_ALIAS=0` 可关闭映射。
+- **移除废弃的免费额度耗尽回退积分版**：删除设置页开关、后端 6004 自动回退到付费 `-sg` 通道的逻辑与相关测试；免费额度耗尽后不再自动产生积分扣费。
+- **并发名额与账号筛选修复**：上游 400 / 未处理 4xx 透传前归还账号并发名额，避免账号被永久标记为占满；网关重启或重新登录后重置旧账号筛选，避免账号列表被过滤成空。
+- **面板与日志体验修复**：修复手机端账号区按钮和徽章挤压、自绘下拉面板被祖先裁剪、权重列不可读；聊天请求头到达时记录 `chat head`，`responses:` 日志同时记录客户端与实际生效的推理强度。
+- 全量测试：**277 个套件：209 个 Python + 68 个 JS，`277 passed, 0 failed, 0 skipped`**。
+
 ## v2.0.0
 
 **项目停止维护（2026-11-06）**：后续不再更新代码、不跟进上游变化、不再处理新的 issue / PR。感谢大家的 star。
@@ -845,6 +853,8 @@ Windows 便携包补一个可选的前台窗口启动入口：默认仍是静默
 
 ## 未发布
 
+- **一键测试不再把 Clash fake-IP 误判为本机断网**：Clash Verge / sing-box 开启 fake-IP 后，所有域名都解析到 `198.18.0.0/15`，而 Python 的 `ipaddress` 把这段 IANA benchmarking 地址算作 `is_private`；连通性探针在 TCP 握手前就拒绝，面板于是弹「本机网络不通：解析到非公网地址 198.18.0.11」，可真实请求链路并不做这个检查（实测到 fake-IP 的 TCP+TLS 可达，证书正确）。现在 `_is_public_addr()` 单独放行 fake-IP 段，环回 / RFC1918 / 链路本地 / 保留段仍照旧拒绝，并新增回归用例钉住「放行后继续走 TCP 握手」。实测 fake-IP 环境下 cn/intl 探针均 ok，一键测试 5/5 账号通过。 / One-click test no longer mistakes Clash fake-IP for a dead local network: with Clash Verge / sing-box fake-IP enabled every hostname resolves into `198.18.0.0/15`, which Python's `ipaddress` classifies as `is_private` (IANA benchmarking range); the connectivity probe refused it before the TCP handshake, so the panel reported "local network down" even though real requests were fine (TCP+TLS to the fake IP is reachable with a valid certificate). `_is_public_addr()` now allowlists the fake-IP range while loopback / RFC1918 / link-local / reserved addresses stay rejected, with a regression test asserting the address proceeds to the TCP handshake. Verified under fake-IP: both cn/intl probes ok and 5/5 accounts passed the one-click test.
+- **面板密码加密异常明确报错**（#658）：解释器缺少 `hashlib.pbkdf2_hmac` 支持时（如 Windows SAC 拦截便携运行时 DLL），不再将计算异常吞成「密码错误」返回 401，而是明确返回 500 与环境排查指引；启动自检与 `/health`、`/panel/status` 暴露 `crypto_ok` 状态并在面板提示。新增 `tests/_test_panel_crypto_unavailable.py`。
 - **智能体一键配置 (Agent Config)**：参照 EasyCLIProxyAPI 的 agents 机制，支持对本机 Claude Code、Codex CLI、OpenCode、DSH、Crush 客户端的一键检测、配置写入与安全备份还原；内置纯标准库文本级 YAML/TOML/JSON 编辑器与两阶段事务回滚保护。
 - 新增 `tests/_test_agents.py`（26 项 / 97 断言）：覆盖 YAML/TOML/dotenv/JSON 编辑器、客户端注册表、两阶段原子回滚、备份还原与网关 handlers 端到端测试。
 - 新增 `tests/_test_agent_ui.js`（18 项断言）：把看板脚本载入 DOM 桩后直接调用真实的 `applyAgent()` / `restoreAgent()` / `loadAgents()`，断言实际发出的请求体与渲染结果，钉住请求字段名漂移与未声明标识符这两类只在浏览器里暴露的缺陷。
