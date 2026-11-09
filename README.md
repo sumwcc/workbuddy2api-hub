@@ -20,7 +20,7 @@
 This project is for protocol research and personal use only. Prefer the official client, do not use your primary account, and do not resell or share access.
 
 <p align="center">
-  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v2.0.1-2496ED?style=flat-square" alt="Version 2.0.1"></a>
+  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v2.0.6-2496ED?style=flat-square" alt="Version 2.0.6"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -233,7 +233,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 | 聊天补全 | `POST` | `/v1/chat/completions` | 标准 OpenAI 聊天接口（支持流式 SSE 与思维链回填） |
 | 交互式响应 | `POST` | `/v1/responses` | OpenAI Responses 协议接口（Codex 专用） |
 | 模型目录 | `GET` | `/v1/models` | 获取当前出口对齐的官方可用模型列表 |
-| 生图 | `POST` | `/v1/images/generations` | 文生图 / 图生图（需在设置中启用媒体模块） |
+| 生图 | `POST` | `/v1/images/generations` | 文生图 / 图生图（始终可用，按媒体号池自动选出口） |
 | 生视频 | `POST` | `/v1/videos` | 异步生视频任务提交（本地并发排队与空闲调度） |
 | 视频状态 | `GET` | `/v1/videos/<id>` | 轮询视频生成进度与结果 |
 | 产物下载 | `GET` | `/v1/videos/<id>/content` | 下载视频 MP4 产物直链 |
@@ -248,7 +248,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 281 个套件：212 个 Python + 69 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 289 个套件：218 个 Python + 71 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -258,6 +258,14 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 
 ### Unreleased
 
+- **账号 JSON 批量导入**：账号工具栏的「导入」现在可以一次选择多个 JSON 文件。面板会先按选择顺序解析并校验全部文件，再合并成一个文档做一次 dry-run 预览；任一文件不是合法 JSON、没有账号或账号列表为空时整体中止，不会只导入一部分。单文件导入与原有覆盖 / 分组选项保持不变。
+- **媒体能力始终开启**：`/v1/images/*` 与 `/v1/videos/*` 不再依赖总开关，设置页只保留「每分钟生图上限」「视频时长上限」「生视频并发」「每 Key 每日积分上限」四项。请求优先使用 API Key 绑定的出口，未绑定时自动选择当前有可用媒体账号的出口；旧 `settings.json` 中的 `enabled` / `realm` / `identity` 会被忽略并在下次保存时清除。没有可用媒体账号时返回 502（上游暂不可用），不再用 404 让客户端误以为部署没有媒体能力。
+- **可选 Go/uTLS 传输桥**：新增本地 Go/uTLS CONNECT 桥接器，可按目标平台启用 Node/OpenSSL 兼容的 ClientHello（18 个 Cipher、10 个 Extension、无 ALPN），Python 仍负责 HTTP 构造、连接复用与 SSE 读取。默认继续使用 Python/OpenSSL，只有设置 `WB_TLS_FINGERPRINT=node` 才启用；支持自动发现便携包内的 Windows / macOS / Linux amd64、arm64 桥接器，OpenWrt 额外支持 armv7。桥接器仅监听回环地址，使用启动时随机认证密钥，并继续验证上游证书。
+- **设备 Token 与桌面 chat 兼容**：账号支持独立 `deviceToken`，也可从设置页配置 `device_token_file` 并在不暴露 token 本体的前提下热重载；优先级为账号 token > settings 字面值 > 文件。新增可选桌面 chat 兼容头（`X-Agent-Runtime`、`baggage` 与会话字段），默认关闭。
+- **请求体兼容性增强**：国内版 Kimi 工具 schema 自动内联 `$ref/$defs`；可选最小输出预算（`WB_MIN_OUTPUT_BUDGET=1`）与无可见输出的 length 终止重试；面板与日志继续对设备 token 脱敏。
+- **文本号池 / 媒体号池改为可选隔离**（#841）：默认所有账号都可同时服务文本与图片 / 视频，不再需要单独分配媒体号；设置页「文本 / 媒体号池隔离」显式开启后，才按账号 `poolScope`（`text` / `media`）限制派发，空媒体池也不会回落到文本池。面板仍可按号池筛选、单号切换或勾选批量挪池；双实例可分别设 `WB_POOL_SCOPE=text|media` 做进程级硬隔离，`WB_POOL_SEPARATION` 可覆盖设置值。签到、成长、猫猫、国际每日活跃只看账号自己的 `tasksEnabled`，媒体号同样会出现在国内任务下拉框；Token 保活仍覆盖全部账号。
+- **历史思考镜像 / Upstream reasoning mirror**：模型名以 `kimi`、`glm`、`minimax`、`mimo`、`step` 或 `space-bunny` 开头时，在工具消息合并完成之后，把非空 `reasoning_content` 原样镜像到上游读取的 `reasoning`；不写空白占位，也不注入 DeepSeek 的 `thinking`。`deepseek` 与 `hy` 不在本镜像范围内。Preserve 只保证发往 WorkBuddy 的字段，不宣称模型长期质量。 / For models whose names start with `kimi`, `glm`, `minimax`, `mimo`, `step`, or `space-bunny`, non-empty `reasoning_content` is mirrored verbatim to the upstream-read `reasoning` after tool-message merging; no blank placeholder is written and DeepSeek `thinking` is not injected. `deepseek` and `hy` are outside this mirror. Preservation guarantees only the fields sent to WorkBuddy, not long-term model quality.
+- **空文本段先补位再出站 / Fill empty text parts before they leave（code 11151）**：上游对 content 里每个 `type:"text"` 段做长度校验，`text` 为 `""`、`null` 或缺失时回 `400` / `11151`「a message has empty content」，而这条历史每一轮都会重放，会话就此退役。触发点不只是客户端真的发了 parts 数组：上游会把**字符串** content 里以 `[` 开头的 JSON 数组当 parts 解析，于是工具结果里常见的表单 / 按钮抓取（`[{"type":"text","text":""}]`）被当成一个空文本段。现在 `build_upstream_body()` 在工具调用配对修复之后、发出之前多一道 `guard_empty_text_parts()`：真实 parts 列表与被嗅探的字符串数组里的空 text 段填成一个空格（上游只校验长度非零，模型看不到任何内容），未知 type、非数组 JSON、纯文本与 `text` 非空的部分逐字节不变，两次执行结果相同。影响面仅限「上游本来会 400」的请求形状。 / The upstream validates every `type:"text"` part and answers `400` / `11151` when `text` is `""`, `null` or missing — and because the history is replayed on every turn, that retires the conversation. A captured form dump in a tool result is enough: a *string* content that starts with `[` is parsed as chat parts, so `[{"type":"text","text":""}]` becomes an empty part. `build_upstream_body()` now runs `guard_empty_text_parts()` after the tool-pairing repairs and fills those parts with a single space (the upstream only checks for non-zero length, so nothing model-visible changes). Unknown part types, non-array JSON, plain text and non-empty parts stay byte-for-byte identical, and the pass is idempotent. Only payload shapes the upstream would have rejected are affected.
 - 新增可选的订阅桥接（#830）：把 Clash / Mihomo 订阅、V2Ray URI 或单个 HTTP / SOCKS 代理转换成 mihomo listener，并同步成网关代理槽。direct 代理现在会正确生成 `proxies` 条目；HTTP 订阅与 HTTP 代理可以区分；缺失 PyYAML 时会返回明确错误。Docker 与宿主 mihomo 的联动仍需按 `docs/SUBBRIDGE.md` 挂载配置。
 - 新增 `start-workbuddy-all.bat`：一条命令先通过 `--probe-only` 确认端口上是健康的本项目实例，未运行时再拉起代理，随后打开 WorkBuddy 执行器工作台窗口。端口被陌生服务或卡死实例占用时会直接报错，不再误判为“已在运行”。网关目录、Node、Python 可用 `WORKBUDDY_GATEWAY_DIR` / `WORKBUDDY_NODE` / `WORKBUDDY_PYTHON` 覆盖，端口用第一个参数指定（默认 8788）；`WORKBUDDY_LAUNCH_SKIP_WINDOW=1` 只起代理不开窗口。
 - **Responses 历史推理保真 / Responses reasoning replay fidelity**：修复连续 `reasoning` 项目只剩最后一段、相邻两轮助手消息被合并、Chat 形状助手历史里的 `reasoning_content` 被丢弃，以及内置 web 工具第二轮请求丢失第一轮推理的问题；推理只关联所属助手消息，不会写入 user/system/tool 普通文本，也不会猜测或改写外部提供者的加密 `encrypted_content`。保真只证明历史按原样送达 WorkBuddy Chat 上游，不额外保证模型的长期任务质量。 / Fix consecutive reasoning replay overwrites, adjacent assistant-turn collapse, Chat-shaped `reasoning_content` loss, and reasoning loss across built-in web-tool follow-ups. Reasoning stays attached to its assistant message, never enters user/system/tool text, and foreign encrypted content is never guessed or rewritten. Preservation proves delivery to the WorkBuddy Chat upstream only, not long-task model quality.
@@ -310,6 +318,7 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 - **[L0NE-6/WorkBuddy-Daily](https://github.com/L0NE-6/WorkBuddy-Daily)**：国内版微信小程序专属事件指纹与动态专家深链任务模型；
 - **[88lin/workbuddy-auto-signin](https://github.com/88lin/workbuddy-auto-signin)**：猫猫日常旅行与成长能量开盲盒（Buddy 盲盒）安全生命周期；
 - **[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)**：国内版连登管家闭环逻辑与轻量对话活跃上报事件；
+- **[misakano7545/workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel)**：Go/uTLS Node/OpenSSL ClientHello 指纹参数与桥接实现参考（18 Cipher、10 Extension、无 ALPN）；
 - **[Zhengyuuuui/workbuddy2api](https://github.com/Zhengyuuuui/workbuddy2api)**：国际版 11140 风控限制识别、冷却规避与故障排查清单；
 - **[yuanyuanyuan430/workbuddy2api-hub](https://github.com/yuanyuanyuan430/workbuddy2api-hub)**：国际版 EdgeOne CDN 证书错配排查与活跃上报优雅降级方案；
 - **[CangShui/workbuddy-cliproxy-fix](https://github.com/CangShui/workbuddy-cliproxy-fix)** & **[lovingfish/workbuddy-cliproxy](https://github.com/lovingfish/workbuddy-cliproxy)**：早期客户端代理修复与网关通信原型；

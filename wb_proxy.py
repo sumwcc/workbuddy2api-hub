@@ -18,6 +18,7 @@ import argparse
 import base64
 import bisect
 import calendar
+import copy
 import errno
 import gzip
 import hashlib
@@ -78,6 +79,9 @@ import wb_logstore
 import wb_media
 import wb_media_client
 import wb_media_tasks
+import wb_pool_media
+import wb_pool_scope
+import wb_pool_text
 import wb_pricing
 import wb_usage_io
 import wb_settings
@@ -811,10 +815,13 @@ def media_account_by_uid(uid):
     `import wb_proxy` 会把模块代码再跑一遍，拿到一个 `POOL is None` 的影子模块。
     后果是提交成功却立刻 "账号已不可用"。这里读的是本模块自己的 POOL 全局量。
     """
-    pool = POOL
+    _, pool = _ensure_pools()
     if pool is None:
         return None
     try:
+        # Task recovery may only resume on a media-pool account. Moving the
+        # account back to text makes the task fail clearly instead of silently
+        # using a text credential for image/video work.
         return pool.get(uid)
     except Exception:
         return None
@@ -860,7 +867,7 @@ def resolve_reference_uploads(body, realm, model_id, account=None):
     return body
 
 
-def _pick_media_account_for(realm, model_id, cost_hint, excluded, config=None):
+def _pick_media_account_for(realm, model_id, cost_hint, excluded):
     """选账号的**模块级**实现（后台提交线程也能用）。
 
     `Handler._pick_media_account` 只是薄薄一层：它把 self 上的 Key 白名单/钉账号
@@ -875,6 +882,14 @@ def _pick_media_account_for(realm, model_id, cost_hint, excluded, config=None):
             "上游账号级限制生效中（整池暂停），%d 秒后再试" % (int(hold) + 1))
     pinned = pinned_account()
     if pinned is not None:
+        _, medias = _ensure_pools()
+        if medias is not None:
+            try:
+                medias.require(pinned)
+            except wb_pool_scope.ScopeViolation as exc:
+                raise wb_media.MediaError("AUTH", str(exc))
+            except wb_pool_text.PoolBoundaryBlocked as exc:
+                raise wb_media.MediaError("NO_ROUTE", str(exc))
         if pinned.realm != realm:
             raise wb_media.MediaError(
                 "INVALID_ARGS", "钉住的账号属于 %s 出口，媒体只走 %s" % (pinned.realm, realm))
@@ -885,13 +900,67 @@ def _pick_media_account_for(realm, model_id, cost_hint, excluded, config=None):
         if not ok:
             raise wb_media.MediaError("NO_CREDIT", "钉住的账号付不起这次调用：%s" % reason)
         return pinned
-    account = POOL.pick(realm=realm, exclude=excluded or set(), model=model_id)
+    _, medias = _ensure_pools()
+    account = (medias.pick(realm=realm, exclude=excluded or set(),
+                           model=model_id)
+               if medias is not None else None)
     if account is None:
         return None
     ok, reason = media_budget_ok(account, cost_hint)
     if not ok:
         raise wb_media.MediaError("NO_CREDIT", "%s 付不起这次调用：%s" % (account.uid[:8], reason))
     return account
+
+
+def _media_realm_for_key(handler=None, requested=None):
+    """Choose the media exit without a persisted media-realm setting.
+
+    Priority:
+      1. the API key's bound realm,
+      2. an explicitly requested realm (only for the catalogue endpoint),
+      3. the only realm that currently has usable media accounts,
+      4. the panel's active realm when it has media accounts, otherwise any
+         realm with media accounts, and finally the active realm for a fresh
+         install.
+    """
+    # /health is also served without an API key and is exercised by lightweight
+    # request doubles that only implement the health-facing surface. Treat a
+    # missing key context as an unbound request instead of assuming every
+    # handler carries the full authentication helpers.
+    allowed = None
+    bound = ""
+    if handler is not None:
+        allowed_getter = getattr(handler, "_key_allowed_accounts", None)
+        realm_getter = getattr(handler, "_key_realm", None)
+        if callable(allowed_getter):
+            allowed = allowed_getter()
+        if callable(realm_getter):
+            bound = realm_getter() or ""
+    if bound:
+        return bound
+    if requested:
+        # Let the caller's validation turn an unknown explicit realm into 400.
+        return requested
+
+    _, medias = _ensure_pools()
+    realms = [realm for realm in wb_settings.MEDIA_REALMS
+              if medias is not None
+              and medias.count_ready(realm=realm, allowed=allowed, refresh=False) > 0]
+    if len(realms) == 1:
+        return realms[0]
+    if CURRENT_REALM in realms:
+        return CURRENT_REALM
+    if realms:
+        return realms[0]
+    # 没有可用账号时，仍要能从留档目录提供模型清单。否则一次冷启动会
+    # 把“暂时没有账号”误报成“媒体路由不存在”，客户端会以为功能未开启。
+    catalog_realms = [realm for realm in wb_settings.MEDIA_REALMS
+                      if read_catalog_dump(realm) is not None]
+    if CURRENT_REALM in catalog_realms:
+        return CURRENT_REALM
+    if catalog_realms:
+        return catalog_realms[0]
+    return CURRENT_REALM if CURRENT_REALM in wb_settings.MEDIA_REALMS else "cn"
 
 
 def media_tasks():
@@ -939,14 +1008,13 @@ def submit_queued_video_task(task):
     excluded = set(store.busy_accounts() or ())
 
     def pick(avoid):
-        config = wb_settings.media_config(ACCOUNTS_DIR)
         try:
             cost_hint = media_cost_hint(task.get("model"),
                                         task.get("seconds") or 5,
                                         task.get("resolution"))
         except Exception:
             cost_hint = 0
-        return _pick_media_account_for(realm, model_id, cost_hint, avoid, config)
+        return _pick_media_account_for(realm, model_id, cost_hint, avoid)
 
     account = pick(excluded)
     if account is None:
@@ -1725,6 +1793,11 @@ def _persist_usage(row, fail_label):
         os.makedirs(USAGE_DIR, exist_ok=True)
         with open(USAGE_LOG, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        # The daily guard is evaluated on the next request. Let its cached fold
+        # observe this row immediately instead of handing the same account a
+        # request for up to _STATS_TTL seconds after it crossed the limit.
+        with _daily_usage_lock:
+            _daily_usage["at"] = 0.0
     except Exception as exc:
         log("%s: %s" % (fail_label, exc))
 
@@ -3771,7 +3844,8 @@ def _remaining_payload(now=None, accounts=None):
     """
     now = time.time() if now is None else now
     if accounts is None:
-        accounts = list(POOL.accounts) if POOL else []
+        texts, _ = _ensure_pools()
+        accounts = texts.accounts() if texts else []
     accounts = [a for a in accounts
                 if getattr(a, "enabled", True) and getattr(a, "uid", "")]
     with _remaining_state_lock:
@@ -6759,6 +6833,49 @@ def recent_usage(limit=100, realm=None, page=1):
         "rows": page_rows
     }
 POOL = None
+# Dispatch views over the one shared AccountPool. The pool owns credentials,
+# refresh, proxies and guards; these two views only enforce which kind of
+# traffic each account may serve.
+TEXTS = None
+MEDIAS = None
+
+
+def _pool_views_ready():
+    """Whether both dispatch views are bound to the current POOL."""
+    return (TEXTS is not None and MEDIAS is not None
+            and getattr(TEXTS, "pool", None) is POOL
+            and getattr(MEDIAS, "pool", None) is POOL)
+
+
+def _ensure_pools():
+    """Return the dispatch views, rebinding them if POOL was replaced.
+
+    Production binds once after loading. Tests and embedders assign the
+    module-level POOL directly; without this check they would keep using a
+    stale pool from an earlier test.
+    """
+    if POOL is None:
+        return None, None
+    if not _pool_views_ready():
+        return _bind_pools()
+    return TEXTS, MEDIAS
+
+
+def _bind_pools():
+    """Bind text/media dispatch views to the loaded account pool."""
+    global TEXTS, MEDIAS
+    if POOL is None:
+        TEXTS = None
+        MEDIAS = None
+    else:
+        TEXTS = wb_pool_text.TextPool(POOL, log=log)
+        MEDIAS = wb_pool_media.MediaPool(POOL, log=log)
+    return TEXTS, MEDIAS
+
+
+def _pool_representative(realm=None, scope=None):
+    """``representative_account`` for code that already owns a pool view."""
+    return representative_account(realm=realm, scope=scope)
 
 # Pinned-account routes (/u/<ref>/v1/...): the handler strips the prefix and
 # resolves the ref before dispatching. One thread serves one connection at a
@@ -6862,6 +6979,8 @@ def _credits_sweep(targets, paced=True):
 # Release discovery only - the checker never downloads or installs anything.
 UPDATES = None
 ACCOUNTS_DIR = os.environ.get("ACCOUNTS_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'accounts')
+wb_pool_scope.configure_separation_resolver(
+    lambda: wb_settings.pool_separation_enabled(ACCOUNTS_DIR))
 try:
     # Panel-set version overrides ride on top of the verified defaults; the
     # identity module only changes the version strings it sends.
@@ -6969,7 +7088,11 @@ def account_views(realm=None):
     """List view of every account, including a live readiness flag."""
     if not POOL:
         return []
-    return POOL.list_public(realm=realm)
+    rows = POOL.list_public(realm=realm)
+    for row in rows:
+        row["poolScope"] = wb_pool_scope.normalize_scope(
+            row.get("poolScope"))
+    return rows
 
 
 def _finite_number(value):
@@ -9929,6 +10052,9 @@ def _usage_cache_schedule_retry(kind):
 # 放手），会把瞬时的锁竞争误判成「状态不可序列化」。
 _USAGE_CACHE_BUSY = "state lock busy"
 _USAGE_CACHE_UNSERIALISABLE = "state not serialisable (kind state has no checkpointable shape)"
+# 定价总开关关着时，折叠不会读取任何价格，state["pricing"] 必然为 None。
+# 这是操作者的显式选择，不是状态损坏；单独标记，避免 WARN 和无效补写。
+_USAGE_CACHE_PRICING_OFF = "pricing disabled (cost estimation off)"
 _usage_cache_collect_reason = {}
 
 
@@ -9955,11 +10081,17 @@ def _usage_cache_note_skip(kind, why=None):
     now = time.time()
     with _usage_cache_retry_lock:
         _usage_cache_skip_counts[kind] = _usage_cache_skip_counts.get(kind, 0) + 1
+        # count 必须在节流判断外取：下面的「不可序列化到 3 次就停手」分支
+        # 在 should_log 为 False 时同样要读它。
+        count = _usage_cache_skip_counts[kind]
+        # 定价关闭时本来就没有可写的价记录：不占日志节流窗口，也不登记
+        # 永远无法成功的补写。跳过计数仍然保留，便于现场确认确实发生过。
+        if why and why.startswith(_USAGE_CACHE_PRICING_OFF[:30]):
+            return
         last = _usage_cache_skip_logged.get(kind)
         should_log = last is None or (now - last) >= _USAGE_CACHE_SKIP_LOG_SECONDS
         if should_log:
             _usage_cache_skip_logged[kind] = now
-            count = _usage_cache_skip_counts[kind]
     if should_log:
         # WARN 而不是默认的 INFO：这是「某类即将不落盘」的唯一信号，面板按
         # WARN 筛问题时要能看到它。
@@ -11229,16 +11361,27 @@ def _usage_cache_collect_kind(kind):
     if kind == "snapshot":
         entries = []
         done = 0
+        pricing_off = False
+        pricing_disabled = not wb_pricing.pricing_enabled()
         with _lock_if_free(_usage_snap_state_lock) as held:
             if not held:
                 return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             for realm, state in _usage_snap_state.items():
+                # 总开关关着时这份折叠没有价记录，写出去也不会被采纳端采用。
+                # 只跳过确实因开关关闭而缺少 pricing 的状态；价表读取失败等
+                # 其他原因仍按不可序列化上报。
+                if pricing_disabled and state.get("pricing") is None:
+                    pricing_off = True
+                    continue
                 entry = _usage_cache_snapshot_entry(realm, state)
                 if entry is not None:
                     entries.append(entry)
                     done = max(done, state["offset"])
-        return (entries, done) if entries else _usage_cache_mark_reason(
-            kind, _USAGE_CACHE_UNSERIALISABLE)
+        if entries:
+            return entries, done
+        return _usage_cache_mark_reason(
+            kind, _USAGE_CACHE_PRICING_OFF if pricing_off
+            else _USAGE_CACHE_UNSERIALISABLE)
     if kind == "by_account":
         with _lock_if_free(_byacct_state_lock) as held:
             if not held:
@@ -11250,16 +11393,24 @@ def _usage_cache_collect_kind(kind):
     if kind == "analytics":
         entries = []
         done = 0
+        pricing_off = False
+        pricing_disabled = not wb_pricing.pricing_enabled()
         with _lock_if_free(_analytics_state_lock) as held:
             if not held:
                 return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             for realm, state in _analytics_state.items():
+                if pricing_disabled and state.get("pricing") is None:
+                    pricing_off = True
+                    continue
                 entry = _usage_cache_analytics_entry(realm, state)
                 if entry is not None:
                     entries.append(entry)
                     done = max(done, state["offset"])
-        return (entries, done) if entries else _usage_cache_mark_reason(
-            kind, _USAGE_CACHE_UNSERIALISABLE)
+        if entries:
+            return entries, done
+        return _usage_cache_mark_reason(
+            kind, _USAGE_CACHE_PRICING_OFF if pricing_off
+            else _USAGE_CACHE_UNSERIALISABLE)
     if kind == "series":
         entries = []
         done = 0
@@ -11416,8 +11567,31 @@ def _usage_cache_maybe_save(kind, offset):
     return wrote
 
 
+def _panel_upstream_config(accounts_dir):
+    """Upstream settings safe for the panel; the token value never leaves here."""
+    config = wb_settings.upstream_config(accounts_dir)
+    config.pop("device_token", None)
+    return config
+
+
+def _panel_device_token_status(accounts_dir):
+    """Redacted device-token status; a broken file must not break settings."""
+    try:
+        return wb_accounts.device_token_status(accounts_dir)
+    except Exception as exc:
+        log("could not read device token status: %s" % type(exc).__name__,
+            level="WARN", tag="settings")
+        return {
+            "source": "none",
+            "configured_file": "",
+            "loaded": False,
+            "length": 0,
+            "cached_at": 0,
+        }
+
+
 def runtime_settings_view():
-    """Current panel-visible settings (never returns the password or the key)."""
+    """Current panel-visible settings (never returns passwords or secrets)."""
     key = API_KEY or ""
     if len(key) > 8:
         masked = key[:4] + "*" * 6 + key[-4:]
@@ -11520,6 +11694,12 @@ def runtime_settings_view():
             wb_settings.remaining_priority_enabled(ACCOUNTS_DIR),
         "egress_backoff_enabled":
             wb_settings.egress_backoff_enabled(ACCOUNTS_DIR),
+        "pool_separation_enabled":
+            wb_settings.pool_separation_enabled(ACCOUNTS_DIR),
+        # The checkbox reflects the persisted preference; this reflects what
+        # dispatch actually enforces (env vars and standalone pool entries win).
+        "pool_separation_effective":
+            wb_pool_scope.separation_enabled(),
         "restriction_hold_seconds":
             int(wb_settings.restriction_hold_seconds(ACCOUNTS_DIR)),
         "restriction_holds":
@@ -11533,12 +11713,11 @@ def runtime_settings_view():
         "account_inflight": account_inflight_snapshot(),
         "affinity_stable_key_enabled":
             wb_settings.affinity_stable_key_enabled(ACCOUNTS_DIR),
-        # 媒体能力（生图 / 生视频）。默认关；面板把它读回去，才知道开关该画在哪一格。
+        # 媒体能力（生图 / 生视频）限额。路由始终开启，面板只画这四项。
         "media": wb_settings.media_config(ACCOUNTS_DIR),
         "media_limits": dict(wb_settings.MEDIA_LIMITS),
         "media_minimums": dict(wb_settings.MEDIA_MINIMUMS),
         "media_realms": list(wb_settings.MEDIA_REALMS),
-        "media_identities": list(wb_settings.MEDIA_IDENTITIES),
         "log_db_enabled": wb_settings.log_db_enabled(ACCOUNTS_DIR),
         "log_db_max_rows": wb_settings.log_db_max_rows(ACCOUNTS_DIR),
         "log_db_max_days": wb_settings.log_db_max_days(ACCOUNTS_DIR),
@@ -11559,7 +11738,9 @@ def runtime_settings_view():
         ],
         "keep_backups": wb_settings.keep_backups(ACCOUNTS_DIR),
         "keep_backups_max": wb_settings.MAX_KEEP_BACKUPS,
-        "upstream": wb_settings.upstream_config(ACCOUNTS_DIR),
+        "upstream": _panel_upstream_config(ACCOUNTS_DIR),
+        "device_token_status": _panel_device_token_status(ACCOUNTS_DIR),
+        "desktop_chat_compat": wb_settings.desktop_chat_compat(ACCOUNTS_DIR),
         "max_payload_mb": wb_settings.max_payload_mb(ACCOUNTS_DIR),
         "max_payload_bytes_effective": (wb_settings.max_payload_mb(ACCOUNTS_DIR) * 1024 * 1024
                                         if wb_settings.max_payload_mb(ACCOUNTS_DIR) is not None
@@ -11573,11 +11754,37 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "2.0.1",
+        "version": "2.0.6",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
-    return POOL.representative() if POOL else None
+    return representative_account(scope=_representative_text_scope())
+
+
+def _representative_text_scope():
+    """Keep the old text-only display when pool separation is enabled."""
+    if wb_pool_scope.separation_enabled():
+        return wb_pool_scope.SCOPE_TEXT
+    return None
+
+
+def representative_account(realm=None, scope=None):
+    """Pool representative with a legacy-pool compatibility fallback.
+
+    AccountPool accepts ``scope``; test and embedding pools written before
+    pool separation only accept ``realm``. Catalog refresh, health summaries
+    and media catalog reads all need the same seam, so the fallback lives
+    here instead of being repeated at every call site.
+    """
+    if POOL is None:
+        return None
+    if scope is not None:
+        try:
+            return POOL.representative(realm=realm, scope=scope)
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+    return POOL.representative(realm=realm)
 
 def quota_scan_interval_hours():
     """The polling period the quota scanner runs on, for the panel caption."""
@@ -12318,7 +12525,8 @@ def models_available_for(model, realm):
     """
     if POOL is None:
         return True
-    usable = [a for a in POOL.accounts
+    texts, _ = _ensure_pools()
+    usable = [a for a in (texts.accounts() if texts else POOL.accounts)
               if a.realm == realm and a.enabled and a.access_token]
     if not usable:
         return False
@@ -12726,7 +12934,8 @@ def fetch_remote_product_config(realm):
     """
     if realm not in ("intl", "cn") or POOL is None:
         return None
-    account = POOL.representative(realm=realm)
+    account = representative_account(
+        realm=realm, scope=_representative_text_scope())
     if account is None or not account.access_token:
         log("remote catalog: no usable %s account, skipping" % realm)
         return None
@@ -12860,7 +13069,8 @@ def catalog_daily_pass(now=None):
     """
     done = []
     for realm in catalog_daily_due(now):
-        if POOL is None or POOL.representative(realm=realm) is None:
+        if POOL is None or representative_account(
+                realm=realm, scope=_representative_text_scope()) is None:
             continue
         out = refresh_catalog(realm)
         log("catalog daily: %s -> %s" % (realm, out.get("msg")))
@@ -12971,7 +13181,8 @@ def curated_live_sources(realm):
 
 
 def fetch_endpoint_models():
-    account = POOL.pick(realm="intl") if POOL else None
+    texts, _ = _ensure_pools()
+    account = texts.pick(realm="intl") if texts else None
     if account is None:
         log("model discovery skipped: no usable account")
         cached = _models_cache.get("intl", {}).get("data")
@@ -13336,6 +13547,27 @@ def preserve_request_contract_enabled():
         "1", "true", "yes", "on")
 
 
+def sanitize_tools(tools):
+    """Remove channel fingerprints from function descriptions."""
+    if not isinstance(tools, list):
+        return tools
+    out = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            out.append(tool)
+            continue
+        item = dict(tool)
+        fn = item.get("function")
+        if isinstance(fn, dict):
+            fn = dict(fn)
+            desc = fn.get("description")
+            if isinstance(desc, str):
+                fn["description"] = sanitize_text(desc, identity=True)
+            item["function"] = fn
+        out.append(item)
+    return out
+
+
 def sanitize_tool_calls(tool_calls):
     if not isinstance(tool_calls, list):
         return tool_calls
@@ -13387,6 +13619,9 @@ def sanitize_messages(messages):
             if isinstance(item.get("reasoning_content"), str):
                 item["reasoning_content"] = sanitize_text(
                     item["reasoning_content"], identity=False)
+            if not preserve_request_contract_enabled() and isinstance(item.get("reasoning"), str):
+                item["reasoning"] = sanitize_text(
+                    item["reasoning"], identity=False)
             if "tool_calls" in item:
                 item["tool_calls"] = sanitize_tool_calls(item["tool_calls"])
             out.append(item)
@@ -13706,6 +13941,95 @@ def backfill_reasoning_content(messages, model, thinking_enabled=None):
         else:
             out.append(m)
     return out
+
+
+def mirror_upstream_reasoning(messages, model):
+    """Mirror reasoning_content for models whose upstream reads reasoning."""
+    model_prefixes = (
+        "kimi", "glm", "minimax", "mimo", "step", "space-bunny",
+    )
+    model_name = str(model or "").lower()
+    if not any(model_name == prefix or model_name.startswith(prefix + "-")
+               for prefix in model_prefixes):
+        return messages
+    if not isinstance(messages, list):
+        return messages
+    out = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            out.append(message)
+            continue
+        item = dict(message)
+        reasoning_content = item.get("reasoning_content")
+        reasoning = item.get("reasoning")
+        if (isinstance(reasoning_content, str) and reasoning_content.strip()
+                and not (isinstance(reasoning, str) and reasoning.strip())):
+            item["reasoning"] = reasoning_content
+        out.append(item)
+    return out
+# ---------------------------------------------------------------------------
+# Empty text parts (code 11151)
+# ---------------------------------------------------------------------------
+# 上游对每个 text 段做长度校验：`text` 为 "" 或缺失直接 400 / 11151
+# 「a message has empty content」，整段会话就此退役——每次重试都重放同一历史，
+# 换账号也救不回来。触发点不只是客户端真的发了 parts 数组：上游会把**字符串**
+# content 里以 `[` 开头的 JSON 数组当作 parts 解析，于是工具结果里常见的表单 /
+# 按钮抓取（`[{"type":"text","text":""}, ...]`）被当成一个空文本段。
+# 实测（kimi-k3.1-pro，cn 号池）：
+#   [{"type":"text","text":""}]            -> 400 / 11151
+#   [{"type":"text","text":null}]           -> 400 / 11151
+#   [{"type":"text"}]                       -> 400 / 11151
+#   [{"type":"text","text":"   "}]          -> 200（只看长度是否为零）
+#   [{"type":"textarea","text":""}]         -> 200（未识别的 type 被忽略）
+#   {"type":"text","text":""}（非数组）      -> 200（不嗅探对象）
+# 所以只补值、不删段：空 text 段填一个空格，语义不变（模型本来也看不到内容）。
+# 注意前缀空格挡不住嗅探——上游会先跳过空白再解析，别用那种写法。
+EMPTY_TEXT_PART_FILL = " "
+def _fill_empty_text_parts(parts):
+    """Give every empty text part a placeholder; True when one was filled."""
+    changed = False
+    for part in parts:
+        if not isinstance(part, dict) or part.get("type") != "text":
+            continue
+        text = part.get("text")
+        if text is None or text == "":
+            part["text"] = EMPTY_TEXT_PART_FILL
+            changed = True
+    return changed
+def _sniffed_parts(content):
+    """Return the parsed parts when a string body would be read as part list."""
+    if not isinstance(content, str):
+        return None
+    stripped = content.lstrip()
+    if not stripped.startswith("["):
+        return None
+    try:
+        parts = json.loads(stripped)
+    except Exception:
+        return None
+    if not parts or not isinstance(parts, list):
+        return None
+    if not all(isinstance(part, dict) for part in parts):
+        return None
+    return parts
+def guard_empty_text_parts(messages):
+    """Fill empty text parts, in real part lists and in sniffer-parsed strings."""
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            # 只复制要改的 text 段；图片等其余段保持原引用，不改写调用方载荷。
+            parts = [dict(part) if isinstance(part, dict)
+                     and part.get("type") == "text" else part
+                     for part in content]
+            if _fill_empty_text_parts(parts):
+                m["content"] = parts
+        else:
+            parts = _sniffed_parts(content)
+            if parts is not None and _fill_empty_text_parts(parts):
+                m["content"] = json.dumps(parts, ensure_ascii=False)
+    return messages
 # ---------------------------------------------------------------------------
 # Tool & Tool Choice Normalization (avoids code 11101 on object tool_choice)
 # ---------------------------------------------------------------------------
@@ -13873,7 +14197,7 @@ def _normalize_tool_parameters(fn):
     if params is None or not isinstance(params, dict):
         fn["parameters"] = {"type": "object", "properties": {}}
         return
-    p = dict(params)
+    p = copy.deepcopy(params)
     if p.get("type") != "object":
         p["type"] = "object"
     if "properties" not in p or not isinstance(p.get("properties"), dict):
@@ -13954,6 +14278,137 @@ def normalize_tools(obj):
             obj.pop("tools", None)
     else:
         obj.pop("tools", None)
+    if obj.get("tools") and not preserve_request_contract_enabled():
+        obj["tools"] = sanitize_tools(obj["tools"])
+
+
+def _schema_contains_ref(node):
+    if isinstance(node, dict):
+        if "$ref" in node:
+            return True
+        return any(_schema_contains_ref(value) for key, value in node.items()
+                   if key not in ("default", "examples", "example", "enum", "const"))
+    if isinstance(node, list):
+        return any(_schema_contains_ref(value) for value in node)
+    return False
+
+
+def _inline_kimi_schema_node(node, defs, seen=None, depth=0, budget=None):
+    """Inline local JSON Schema references for Kimi tool declarations."""
+    if budget is None:
+        budget = [10000]
+    if depth > 64:
+        return {}
+    if budget[0] <= 0:
+        budget[0] = -1
+        return {}
+    budget[0] -= 1
+
+    if isinstance(node, list):
+        out = []
+        for value in node:
+            expanded = _inline_kimi_schema_node(
+                value, defs, seen=seen, depth=depth + 1, budget=budget)
+            if budget[0] < 0:
+                return {}
+            out.append(expanded)
+        return out
+    if not isinstance(node, dict):
+        return node
+
+    ref = node.get("$ref")
+    if isinstance(ref, str):
+        name = None
+        for prefix in ("#/$defs/", "#/definitions/"):
+            if ref.startswith(prefix):
+                name = ref[len(prefix):].replace("~1", "/").replace("~0", "~")
+                break
+        if name is None:
+            return dict(node)
+        active = set(seen or ())
+        if not name or name not in defs:
+            return {"type": "object"}
+        if name in active:
+            return {}
+        active.add(name)
+        expanded = _inline_kimi_schema_node(
+            defs[name], defs, seen=active, depth=depth + 1, budget=budget)
+        if budget[0] < 0:
+            return {}
+        siblings = {}
+        root = depth == 0
+        for key, value in node.items():
+            if key == "$ref" or (
+                    root and key in ("$defs", "definitions", "$schema")):
+                continue
+            child = _inline_kimi_schema_node(
+                value, defs, seen=active, depth=depth + 1, budget=budget)
+            if budget[0] < 0:
+                return {}
+            siblings[key] = child
+        if siblings and isinstance(expanded, dict):
+            expanded = dict(expanded)
+            expanded.update(siblings)
+        return expanded
+
+    out = {}
+    root = depth == 0
+    for key, value in node.items():
+        if root and key in ("$defs", "definitions", "$schema"):
+            continue
+        if key in ("default", "examples", "example", "enum", "const"):
+            out[key] = value
+            continue
+        child = _inline_kimi_schema_node(
+            value, defs, seen=seen, depth=depth + 1, budget=budget)
+        if budget[0] < 0:
+            return {}
+        out[key] = child
+    return out
+
+
+def inline_kimi_tool_schemas(body):
+    """Inline $ref/$defs in Kimi tool schemas before the request leaves."""
+    if not isinstance(body, dict):
+        return body
+    model = str(body.get("model") or "").strip().lower()
+    if model.startswith("cn:"):
+        model = model[3:].strip()
+    if not model.startswith("kimi") or not isinstance(body.get("tools"), list):
+        return body
+
+    for tool in body["tools"]:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function")
+        if not isinstance(fn, dict):
+            continue
+        params = fn.get("parameters")
+        if not isinstance(params, dict):
+            continue
+        if not ("$defs" in params or "definitions" in params
+                or _schema_contains_ref(params)):
+            continue
+
+        defs = {}
+        for key in ("definitions", "$defs"):
+            values = params.get(key)
+            if isinstance(values, dict):
+                defs.update(values)
+        budget = [10000]
+        expanded = _inline_kimi_schema_node(
+            params, defs, seen=set(), depth=0, budget=budget)
+        if budget[0] < 0:
+            continue
+        if not isinstance(expanded, dict):
+            expanded = {"type": "object"}
+        fn = dict(fn)
+        fn["parameters"] = expanded
+        _normalize_tool_parameters(fn)
+        tool["function"] = fn
+    return body
+
+
 # ---------------------------------------------------------------------------
 # Stop Sequence Normalization (avoids code 11101 on a string stop)
 # ---------------------------------------------------------------------------
@@ -14701,6 +15156,94 @@ def apply_prompt_mode(messages):
     return messages
 
 
+MIN_BUDGET_BY_EFFORT = {
+    "minimal": 4096,
+    "low": 4096,
+    "medium": 6144,
+    "high": 8192,
+    "xhigh": 12288,
+    "max": 16384,
+}
+MIN_OUTPUT_BUDGET_PROBE = 16
+
+
+def min_output_budget_enabled():
+    return os.environ.get("WB_MIN_OUTPUT_BUDGET", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def ensure_min_output_budget(body, model=None):
+    """Raise explicit output budgets to the floor for the active effort."""
+    if not isinstance(body, dict) or "max_tokens" not in body:
+        return body
+    try:
+        current = int(body.get("max_tokens"))
+    except (TypeError, ValueError):
+        return body
+    if current < MIN_OUTPUT_BUDGET_PROBE:
+        return body
+
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and \
+            str(thinking.get("type") or "").strip().lower() == "disabled":
+        return body
+    effort = str(body.get("reasoning_effort")
+                 or body.get("reasoningEffort") or "").strip().lower()
+    if effort == "none":
+        return body
+    floor = MIN_BUDGET_BY_EFFORT.get(effort)
+    if floor is None:
+        return body
+    cap = model_default_max_output_tokens(model) if model else None
+    if cap and cap < floor:
+        floor = cap
+    if current < floor:
+        body["max_tokens"] = floor
+    return body
+
+
+def is_starved_completion(content_text, tool_calls, finish_reason):
+    """A length stop with no visible output and no tool call needs a retry."""
+    return (str(finish_reason or "").strip().lower() == "length"
+            and not str(content_text or "").strip()
+            and not tool_calls)
+
+
+def build_starved_retry_body(body, floor=0):
+    """Build the no-thinking retry body for a starved completion."""
+    if not isinstance(body, dict):
+        return None, False
+    current = None
+    if "max_tokens" in body:
+        try:
+            current = int(body.get("max_tokens"))
+        except (TypeError, ValueError):
+            current = None
+        if current is not None and current < MIN_OUTPUT_BUDGET_PROBE:
+            return None, False
+
+    thinking = body.get("thinking")
+    effort = str(body.get("reasoning_effort")
+                 or body.get("reasoningEffort") or "").strip().lower()
+    if (isinstance(thinking, dict)
+            and str(thinking.get("type") or "").strip().lower() == "disabled") \
+            or effort in ("none", "off", "disabled", "disable"):
+        return None, False
+
+    out = dict(body)
+    out["thinking"] = {"type": "disabled"}
+    out.pop("reasoning_effort", None)
+    out.pop("reasoningEffort", None)
+    try:
+        floor = int(floor or 0)
+    except (TypeError, ValueError):
+        floor = 0
+    if floor > 0 and current is not None \
+            and current >= MIN_OUTPUT_BUDGET_PROBE and current < floor:
+        out["max_tokens"] = floor
+    return out, True
+
+
 def build_upstream_body(payload):
     model = payload.get("model") or ""
     # Map an unsupported level before anything below reads the effort, so the
@@ -14748,7 +15291,11 @@ def build_upstream_body(payload):
     repaired, _merged = merge_adjacent_tool_calls(body["messages"])
     repaired, _repacked = repack_tool_result_blocks(repaired)
     repaired, _cleaned = cleanup_orphan_tool_calls(repaired)
-    body["messages"] = repaired
+    # Last shape check: an empty text part is a hard 400 (11151) whichever side
+    # produced it, and it has to run after the merges above because they can
+    # move a string content into a different message.
+    body["messages"] = guard_empty_text_parts(repaired)
+    body["messages"] = mirror_upstream_reasoning(body["messages"], model)
     translate_max_completion_tokens(body)
     # Upstream GPT-family models enforce a minimum max_output_tokens >= 16;
     # smaller values (e.g. max_tokens=1 from probes) fail with 400 integer_below_min_value (#364, #252).
@@ -14794,6 +15341,8 @@ def build_upstream_body(payload):
                         body["reasoning_effort"] = chosen
     # 显式档位模型（glm-5.1）：不带档位上游直接 400 / 11150，补上目录档位。
     ensure_explicit_effort(body, model)
+    if min_output_budget_enabled():
+        ensure_min_output_budget(body, model)
     body["stream"] = True
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
@@ -15384,7 +15933,9 @@ def retry_after_seconds(model, realm):
     """Shortest wait until any account of this realm can serve `model` again."""
     if not POOL:
         return 60
-    waits = [a.throttle_wait(model=model) for a in POOL.accounts
+    texts, _ = _ensure_pools()
+    accounts = texts.accounts() if texts else list(POOL.accounts)
+    waits = [a.throttle_wait(model=model) for a in accounts
              if a.realm == realm and a.enabled and a.access_token]
     active = [w for w in waits if w > 0]
     return int(min(active)) if active else 60
@@ -16450,8 +17001,16 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
     requested_model = str(payload.get("model") or "")
     model = intl_model_alias(requested_model, realm)
+    texts, _ = _ensure_pools()
     pinned = pin_account if pin_account is not None else pinned_account()
     if pinned is not None:
+        if texts is not None:
+            try:
+                texts.require(pinned)
+            except wb_pool_scope.ScopeViolation as exc:
+                raise PinnedAccountError(403, str(exc), pinned.uid)
+            except wb_pool_text.PoolBoundaryBlocked as exc:
+                raise PinnedAccountError(503, str(exc), pinned.uid)
         if allowed_accounts is not None and pinned.uid not in allowed_accounts:
             raise PinnedAccountError(
                 403, "pinned account '%s' is not allowed by this API key"
@@ -16502,13 +17061,13 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # Only pass `allowed` when the request actually carries a restriction: a
     # stub pool in tests (and any external pool implementation) keeps its old
     # count_ready signature for the unrestricted path.
-    if POOL is None:
+    if texts is None:
         ready_total = 1
     elif allowed_accounts is not None:
-        ready_total = POOL.count_ready(realm, model=model,
-                                       allowed=allowed_accounts)
+        ready_total = texts.count_ready(realm, model=model,
+                                        allowed=allowed_accounts)
     else:
-        ready_total = POOL.count_ready(realm, model=model)
+        ready_total = texts.count_ready(realm, model=model)
     total = 1 if pinned is not None else max(1, ready_total)
     tried = set()
     # 这一轮请求已经记过账的账号：重试轮（transient_hits 后 tried.clear() 整池
@@ -16608,7 +17167,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                           exclude=exclude, model=model, page=affinity_page)
             if allowed_accounts is not None:
                 kwargs["allowed"] = allowed_accounts
-            candidate = POOL.pick_for_session(**kwargs) if POOL else None
+            candidate = texts.pick_for_session(**kwargs) if texts else None
             if candidate is None:
                 return None
             if account_slot_acquire(candidate):
@@ -16685,6 +17244,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             attempt_body = inject_prompt_cache_key(upstream_body, account.uid, session_key)
         else:
             attempt_body = upstream_body
+        if account.realm == "cn" and isinstance(attempt_body.get("tools"), list):
+            attempt_body = dict(attempt_body)
+            attempt_body["tools"] = [dict(tool, function=dict(tool["function"]))
+                                     if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+                                     else tool for tool in attempt_body["tools"]]
+            inline_kimi_tool_schemas(attempt_body)
         # 官方 CLI 的 chat 请求体（见 wb_identity）：gzip（RequestBodyGzip=true，
         # 带 Content-Encoding: gzip）+ 注入 cache_retention=long；Responses API
         # 的字段 / 客户端 metadata 不带。VSCode 官方主 chat 也默认 gzip
@@ -16695,12 +17260,6 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             attempt_body = {k: v for k, v in attempt_body.items()
                             if k not in wb_identity.CLI_BODY_DROP_FIELDS}
             attempt_body["cache_retention"] = wb_identity.CLI_CACHE_RETENTION
-        # 紧凑 JSON：官方客户端（Node JSON.stringify）不带分隔符后的空格，默认的
-        # json.dumps(separators=(", ", ": ")) 会让 body 字节与 Content-Length 都成
-        # 一处机器特征。上游解析等价，只影响线上字节。
-        attempt_data = encode_upstream_body(attempt_body)
-        if cli_identity or vscode_identity:
-            attempt_data = wb_identity.gzip_body(attempt_data)
         # 会话头族（X-Conversation-ID / -Request-ID）的语义见 wb_identity：桌面端
         # 官方客户端同一会话复用同一个 id：桌面端 / CLI 按 (账号, 会话键) 稳定
         # 派生（#448），客户端没给会话键时保持每请求新生成；VSCode 按官方
@@ -16718,6 +17277,13 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             purpose="chat", session_key=session_key,
             turn_request_id=turn_request_id, model=model,
             conversation_id=conv_id)
+        if (account.product == wb_identity.PRODUCT_DESKTOP
+                and wb_identity.desktop_chat_compat_enabled(getattr(account, "accounts_dir", None))):
+            attempt_body = wb_identity.inject_conversation_fields(
+                attempt_body, req_headers.get("X-Conversation-Request-ID"))
+        attempt_data = encode_upstream_body(attempt_body)
+        if cli_identity or vscode_identity:
+            attempt_data = wb_identity.gzip_body(attempt_data)
         if cli_identity or vscode_identity:
             req_headers["Content-Encoding"] = wb_identity.REQUEST_CONTENT_ENCODING
         req = urllib.request.Request(chat_url, data=attempt_data, method="POST",
@@ -17120,16 +17686,21 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                   "window; the pool resumes in %ds" % (realm, model, wait))
         raise RateLimited(None, "usage exceeds frequency limit", wait=wait,
                           message=reason, reset_at=time.time() + wait)
-    enabled = [a for a in POOL.accounts
+    texts, _ = _ensure_pools()
+    text_accounts = texts.accounts() if texts else (POOL.accounts if POOL else [])
+    enabled = [a for a in text_accounts
                if a.realm == realm and a.enabled and a.access_token] if POOL else []
-    if enabled and all(a.daily_limit_blocked() for a in enabled):
+    candidates = [a for a in enabled
+                  if allowed_accounts is None or a.uid in allowed_accounts]
+    if candidates and all(a.daily_limit_blocked() for a in candidates):
         reason = ("every usable account reached today's token limit (%s per "
                   "account); the pool resumes after local midnight"
                   % wb_settings.daily_token_limit(ACCOUNTS_DIR, realm))
         midnight = seconds_until_local_midnight()
         raise RateLimited(None, reason, wait=midnight, message=reason,
                           reset_at=time.time() + midnight)
-    if enabled and model and all(a.credit_limit_blocked(model) for a in enabled):
+    if (candidates and model
+            and all(a.credit_limit_blocked(model) for a in candidates)):
         reason = ("every usable account reached today's credit limit (%s per "
                   "account); paid models resume after local midnight, free "
                   "models keep working"
@@ -17137,7 +17708,8 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         midnight = seconds_until_local_midnight()
         raise RateLimited(None, reason, wait=midnight, message=reason,
                           reset_at=time.time() + midnight)
-    if enabled and model and all(a.model_token_limit_blocked(model) for a in enabled):
+    if (candidates and model
+            and all(a.model_token_limit_blocked(model) for a in candidates)):
         reason = ("every usable account reached today's token limit for %s "
                   "(%s per account); the model resumes after local midnight"
                   % (model, wb_settings.model_daily_token_limit(ACCOUNTS_DIR, realm)))
@@ -17154,8 +17726,6 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                   "raise the cap" % (limit, limit))
         raise RateLimited(None, reason, wait=1, message=reason,
                           reset_at=time.time() + 1)
-    candidates = [a for a in enabled
-                  if allowed_accounts is None or a.uid in allowed_accounts]
     if (model and candidates
             and all(a.blocked_by_model_cooldown(model) for a in candidates)):
         # 全部候选都只差"这个模型的上游窗口恢复"：这是**等待**，不是故障。
@@ -17210,10 +17780,11 @@ def realm_fallback_target(realm, model):
         return ""
     if exclusive_realm(model):
         return ""
-    if POOL is None:
+    texts, _ = _ensure_pools()
+    if texts is None:
         return ""
     try:
-        if POOL.count_ready(realm="cn", model=model) <= 0:
+        if texts.count_ready(realm="cn", model=model) <= 0:
             return ""
     except Exception:
         return ""
@@ -17282,9 +17853,10 @@ def pool_unavailable_detail(realm, model=None, allowed_accounts=None):
     看整个区域——真机上就是这样：Key 绑的 2 个号在冷却，报错却列了全区 4 个
     在冷却的号，而 2 个健康的号（没绑这个 Key）一个字都没提（issue #665）。
     """
-    if POOL is None:
+    texts, _ = _ensure_pools()
+    if texts is None:
         return ""
-    accounts = [a for a in POOL.accounts if a.realm == realm]
+    accounts = [a for a in texts.accounts() if a.realm == realm]
     if allowed_accounts is not None:
         accounts = [a for a in accounts if a.uid in allowed_accounts]
     if not accounts:
@@ -20369,7 +20941,8 @@ def _release_key_slot(key_entry):
 # 新增这类「不读 body」的面板路由，请加进这个元组，别在路由里另写一份。
 BODYLESS_PANEL_POSTS = ("/console/toggle", "/shutdown", "/updates/check",
                         "/updates/install", "/quota-scan/run",
-                        "/settings/restriction/reset")
+                        "/settings/restriction/reset",
+                        "/settings/device-token/reload")
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -20458,7 +21031,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/2.0.1"
+    server_version = "wb-proxy/2.0.6"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -21163,6 +21736,30 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        # 媒体任务/目录/产物与文本模型清单、文本统计各走各的入口。
+        # 媒体入口上的 /v1/models 必须拒绝，否则客户端会以为这个实例也能对话；
+        # 文本入口上的媒体查询同样拒绝，避免把「没有媒体号」误报成媒体功能坏了。
+        is_media_route = (
+            path == "/v1/media/tasks"
+            or path.startswith("/v1/videos/")
+            or path in ("/v1/media/models", "/media/models")
+        )
+        is_text_route = path in (
+            "/v1/models", "/models", "/v1/balance-summary",
+            "/usage", "/v1/usage", "/usage/recent", "/usage/analytics",
+            "/usage/by-account", "/usage/remaining", "/usage/perf",
+            "/usage/timeseries", "/activity/history",
+        )
+        if is_media_route and not wb_pool_scope.entry_allows(
+                wb_pool_scope.SCOPE_MEDIA):
+            return self._error(
+                403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                "pool_boundary")
+        if is_text_route and not wb_pool_scope.entry_allows(
+                wb_pool_scope.SCOPE_TEXT):
+            return self._error(
+                503, "这个入口只服务图片 / 视频生成；文本模型请走文本号池的入口",
+                "pool_boundary")
         # The standalone configurator, for clients on machines that do not run
         # the gateway. Served before the panel gate and deliberately without a
         # session: the machines that need it are exactly the ones that cannot
@@ -21341,13 +21938,12 @@ class Handler(BaseHTTPRequestHandler):
             # CodeArts 只是子字段：它掉线不能把整体 /health 变红。
             info["codearts"] = {"configured": False, "ok": False,
                                 "error": str(exc)[:200]}
-        # 媒体能力：`/health` 是运维第一眼看的地方，早给比晚给好。队列深度等视频
-        # 任务表落地后再补（生图是同步请求，没有队列可报）。
+        # 媒体能力：`/health` 是运维第一眼看的地方，早给比晚给好。媒体路由始终
+        # 可用；`realm` 只是当前自动选择的结果，调用方仍可按 Key 绑定走另一个出口。
         media_cfg = wb_settings.media_config(ACCOUNTS_DIR)
         info["media"] = {
-            "enabled": media_cfg["enabled"],
-            "realm": media_cfg["realm"],
-            "identity": media_cfg["identity"],
+            "enabled": True,
+            "realm": _media_realm_for_key(self),
             "slots": MEDIA_SLOTS,
             "inflight": media_inflight(),
             # 生视频并发：超过就排队，不提交上游、不扣费。
@@ -21581,10 +22177,15 @@ class Handler(BaseHTTPRequestHandler):
         # Fold the usage log before building the view, so the 日限额 badge and
         # the parked count describe right now instead of the last request.
         apply_daily_guards()
+        texts, medias = _ensure_pools()
+        text_ready = texts.count_ready() if texts is not None else 0
+        media_ready = medias.count_ready() if medias is not None else 0
         return self._json_panel(200, {
             "accounts": account_views(realm=query.get('realm', [None])[0] or CURRENT_REALM),
             "storage": ACCOUNTS_DIR,
-            "usable": POOL.count_ready() if POOL else 0,
+            "usable": text_ready,
+            "text_ready": text_ready,
+            "media_ready": media_ready,
         })
 
     def _get_accounts_export(self, query):
@@ -22078,33 +22679,18 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(status, message, err_type)
 
     def _media_config(self):
-        config = wb_settings.media_config(ACCOUNTS_DIR)
-        # 出站身份形状同步给 client（后台 worker 轮询时用的也是这个值）。
-        wb_media_client.set_identity(config.get("identity"))
-        return config
+        return wb_settings.media_config(ACCOUNTS_DIR)
 
     def _media_realm(self, config):
-        """这次媒体请求走哪个出口：Key 绑定的出口优先，其次面板配置。"""
-        bound = self._key_realm()
-        if bound:
-            if bound != config["realm"]:
-                raise wb_media.MediaError(
-                    "INVALID_ARGS",
-                    "本 Key 绑定在 %s 出口，而媒体能力配置在 %s 出口；"
-                    "请换对应出口的 Key，或在设置页把媒体出口改成 %s"
-                    % (bound, config["realm"], bound))
-            return bound
-        return config["realm"]
+        """这次媒体请求走哪个出口：Key 绑定优先，否则自动选择可用出口。"""
+        return _media_realm_for_key(self)
 
     def _media_prepare(self, path, payload, config):
-        """校验开关、挑出模型、拼好请求体。**一个字节都不发**。
+        """挑出模型、拼好请求体。**一个字节都不发**。
 
         放在这里而不是散在路由里，是因为「参数不对」和「上游拒绝」必须能分开：
         前者一分钱没花、不进冷却，后者可能已经扣过积分。
         """
-        if not config["enabled"]:
-            # 关着就是不存在：404 而不是 403，少一个探测面。
-            raise wb_media.MediaError("NO_ROUTE", "not found")
         realm = self._media_realm(config)
         kind = "edit" if path in ("/v1/images/edits", "/images/edits") else "generate"
         prompt = payload.get("prompt")
@@ -22157,9 +22743,15 @@ class Handler(BaseHTTPRequestHandler):
             if payload is not None:
                 _catalog_raw[realm] = payload
         if payload is None:
-            account = POOL.representative(realm=realm) if POOL else None
+            texts, medias = _ensure_pools()
+            account = (medias.pick(realm=realm) if medias is not None
+                       else representative_account(
+                           realm=realm, scope=wb_pool_scope.SCOPE_MEDIA))
             if account is None:
-                raise wb_media.MediaError("NO_ROUTE", "该区没有可用账号，读不到媒体目录")
+                detail = medias.empty_detail(realm) if medias is not None else "该区没有可用账号。"
+                # 没有账号是上游暂时不可用，不是媒体路由不存在。404 会让
+                # 客户端把“稍后重试”误判成“这个部署没有媒体能力”。
+                raise wb_media.MediaError("UPSTREAM", detail)
             payload = wb_media_client._get_json(
                 account, wb_media_client.CONFIG_PATH,
                 wb_media_client.CONFIG_TIMEOUT_SECONDS)
@@ -22188,8 +22780,17 @@ class Handler(BaseHTTPRequestHandler):
                 "RATE_LIMIT",
                 "上游账号级限制生效中（整池暂停），%d 秒后再试" % (int(hold) + 1))
         allowed = self._key_allowed_accounts()
+        _, medias = _ensure_pools()
+        if medias is None:
+            raise wb_media.MediaError("UPSTREAM", "账号池未加载")
         pinned = pinned_account()
         if pinned is not None:
+            try:
+                medias.require(pinned)
+            except wb_pool_scope.ScopeViolation as exc:
+                raise wb_media.MediaError("AUTH", str(exc))
+            except wb_pool_text.PoolBoundaryBlocked as exc:
+                raise wb_media.MediaError("NO_ROUTE", str(exc))
             if allowed is not None and pinned.uid not in allowed:
                 raise wb_media.MediaError("AUTH", "钉住的账号不在本 Key 的绑定范围内")
             if pinned.realm != realm:
@@ -22207,8 +22808,8 @@ class Handler(BaseHTTPRequestHandler):
             return pinned
         skipped = []
         for _ in range(4):
-            account = POOL.pick(realm=realm, exclude=excluded, model=model_id,
-                                allowed=allowed)
+            account = medias.pick(realm=realm, exclude=excluded, model=model_id,
+                                  allowed=allowed)
             if account is None:
                 if skipped:
                     # 有账号、但都被预算刷掉了：说清是谁差多少，别让人以为是池子空了。
@@ -22217,9 +22818,8 @@ class Handler(BaseHTTPRequestHandler):
                         "没有账号付得起这次调用（预估 %g 积分）：%s"
                         % (cost_hint, "；".join(skipped)))
                 raise wb_media.MediaError(
-                    "UPSTREAM",
-                    "没有可用账号跑这次媒体请求%s"
-                    % pool_unavailable_detail(realm, model_id, allowed))
+                    "UPSTREAM", "没有可用账号跑这次媒体请求；"
+                    + medias.empty_detail(realm))
             ok, reason = media_budget_ok(account, cost_hint)
             if ok:
                 return account
@@ -22263,6 +22863,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_media_post(self, path, payload):
         """媒体 POST 的入口：开关 → 参数 → 限流 → 并发槽 → 选号 → 发请求 → 记账。"""
+        if not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_MEDIA):
+            return self._error(
+                403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                "pool_boundary")
         if path in ("/v1/videos", "/videos"):
             # 生视频是异步任务，流程与生图完全不同（提交 / 轮询 / 下载），单独一条。
             return self._media_video_submit(payload)
@@ -22372,8 +22976,6 @@ class Handler(BaseHTTPRequestHandler):
         4xx 一律 REJECTED，可以立刻重试。
         """
         config = self._media_config()
-        if not config["enabled"]:
-            return self._media_error(wb_media.MediaError("NO_ROUTE", "not found"))
         store = media_tasks()
         if store.pending_count() >= store.max_pending:
             # 还没花钱：让客户端看到 429，比让它排队几十分钟好。
@@ -22636,6 +23238,10 @@ class Handler(BaseHTTPRequestHandler):
         """`GET /v1/media/tasks`：最近的任务（面板用）。"""
         if not self._authorized():
             return
+        if not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_MEDIA):
+            return self._error(
+                403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                "pool_boundary")
         try:
             limit = int((query.get("limit") or ["50"])[0])
         except (TypeError, ValueError):
@@ -22666,13 +23272,17 @@ class Handler(BaseHTTPRequestHandler):
 
         与 `/v1/models` 分开是刻意的：那个清单是给聊天客户端用的，把生图模型塞进去
         客户端会拿它去对话。这里返回**未经投影**的媒体条目，`videoGeneration` 原样
-        带走，调用方据此知道自己能要几秒、哪些分辨率。开关关着也能查——配置之前
-        先看看有什么，正是这个接口存在的理由之一。
+        带走，调用方据此知道自己能要几秒、哪些分辨率。未传 `realm` 时自动选择
+        当前有可用媒体账号的出口。
         """
         if not self._authorized():
             return
-        config = self._media_config()
-        realm = (query.get("realm") or [None])[0] or config["realm"]
+        if not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_MEDIA):
+            return self._error(
+                403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                "pool_boundary")
+        requested = (query.get("realm") or [None])[0]
+        realm = _media_realm_for_key(self, requested)
         if realm not in wb_settings.MEDIA_REALMS:
             return self._error(400, "realm must be one of %s"
                                % ", ".join(wb_settings.MEDIA_REALMS),
@@ -22729,8 +23339,7 @@ class Handler(BaseHTTPRequestHandler):
                 model["creditPerSecondCeiling"] = wb_media.COST_VIDEO_PER_SECOND_CEILING
         return self._json(200, {
             "realm": realm,
-            "enabled": config["enabled"],
-            "identity": config["identity"],
+            "enabled": True,
             "models": models,
         })
 
@@ -22745,6 +23354,20 @@ class Handler(BaseHTTPRequestHandler):
             "/v1/messages", "/messages",
             "/v1/messages/count_tokens", "/messages/count_tokens",
         )
+    def _route_device_token_reload(self):
+        """Reload the cached device token without exposing the token itself."""
+        try:
+            wb_accounts.reload_device_token(ACCOUNTS_DIR)
+        except Exception as exc:
+            log("device token reload failed: %s" % type(exc).__name__,
+                level="WARN", tag="settings")
+            return self._error(500, "device token reload failed",
+                               "invalid_request_error")
+        return self._json(200, {
+            "ok": True,
+            "device_token_status": _panel_device_token_status(ACCOUNTS_DIR),
+        })
+
     def _handle_settings_save(self):
         """Persist panel-managed settings from the web settings tab."""
         payload = self._payload_or_error()
@@ -23256,6 +23879,14 @@ class Handler(BaseHTTPRequestHandler):
                 # 由下一个请求照常推（此刻就算推也要先折一次剩余估算，没必要
                 # 为一个开关多付这一趟）。
                 POOL.apply_remaining_weights(None)
+        if "pool_separation_enabled" in payload:
+            raw = payload.get("pool_separation_enabled")
+            if not isinstance(raw, bool):
+                return self._error(
+                    400, "pool_separation_enabled must be true or false",
+                    "invalid_request_error")
+            wb_settings.set_pool_separation_enabled(ACCOUNTS_DIR, raw)
+            reply["pool_separation_enabled"] = raw
         if "realm_fallback_enabled" in payload:
             # 跨出口回退（默认关）：与 remaining_priority_enabled 同一形状——
             # 严格 JSON 布尔，字符串 "false" 会是真值。
@@ -23418,7 +24049,16 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 return self._error(400, str(exc), "invalid_request_error")
             wb_settings.set_upstream_config(ACCOUNTS_DIR, patch)
-            reply["upstream"] = wb_settings.upstream_config(ACCOUNTS_DIR)
+            reply["upstream"] = _panel_upstream_config(ACCOUNTS_DIR)
+            reply["device_token_status"] = _panel_device_token_status(ACCOUNTS_DIR)
+        if "desktop_chat_compat" in payload:
+            raw = payload.get("desktop_chat_compat")
+            if not isinstance(raw, bool):
+                return self._error(
+                    400, "desktop_chat_compat must be true or false",
+                    "invalid_request_error")
+            wb_settings.set_desktop_chat_compat(ACCOUNTS_DIR, raw)
+            reply["desktop_chat_compat"] = raw
         if "usage" in payload:
             raw = payload.get("usage")
             if not isinstance(raw, dict):
@@ -24423,6 +25063,7 @@ class Handler(BaseHTTPRequestHandler):
             targets = [target]
         else:
             targets = POOL.task_accounts("cn")
+        targets = [a for a in targets if a is not None]
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import run_growth_tasks
@@ -24484,6 +25125,7 @@ class Handler(BaseHTTPRequestHandler):
             targets = [target]
         else:
             targets = POOL.task_accounts("cn")
+        targets = [a for a in targets if a is not None]
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import run_streak_bonus
@@ -24510,6 +25152,7 @@ class Handler(BaseHTTPRequestHandler):
             targets = [target]
         else:
             targets = POOL.task_accounts("cn")
+        targets = [a for a in targets if a is not None]
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import do_cat_travel
@@ -24730,6 +25373,7 @@ class Handler(BaseHTTPRequestHandler):
                          if a.realm == "cn"
                          and a.task_active()
                          and not a.uses_enterprise_billing()])
+        targets = [a for a in targets if a is not None]
         results = []
         for account in targets:
             if account is None:
@@ -24758,6 +25402,7 @@ class Handler(BaseHTTPRequestHandler):
                        if a.realm == "intl" and a.task_active() and str(a.uid) in wanted]
         else:
             targets = POOL.task_accounts("intl")
+        targets = [a for a in targets if a is not None]
         results = []
         for account in targets:
             if account is None:
@@ -24782,6 +25427,7 @@ class Handler(BaseHTTPRequestHandler):
             targets = [POOL.get(uid)]
         else:
             targets = POOL.task_accounts("intl")
+        targets = [a for a in targets if a is not None]
         results = []
         for account in targets:
             if account is None:
@@ -24954,6 +25600,13 @@ class Handler(BaseHTTPRequestHandler):
         account = POOL.get(uid)
         if not account:
             return self._error(404, "no such account")
+        texts, _ = _ensure_pools()
+        if texts is not None and not texts.allows(account):
+            return self._error(
+                400,
+                "账号 %s 属于媒体号池，不发起文本模型请求，不能做文本测试"
+                % account.uid[:8],
+                "invalid_request_error")
         model = payload.get("model") or TEST_MODEL_DEFAULT
         row = probe_account(account, model)
         log("account test: uid=%s model=%s wall=%sms ok=%s%s"
@@ -24987,6 +25640,9 @@ class Handler(BaseHTTPRequestHandler):
         model = payload.get("model") or TEST_MODEL_DEFAULT
         targets = [a for a in (POOL.accounts if POOL else [])
                    if a.realm == realm and a.enabled]
+        texts, _ = _ensure_pools()
+        targets = [a for a in targets
+                   if texts is None or texts.allows(a)]
         group = str(payload.get("group") or "").strip()
         if group:
             targets = [a for a in targets if a.group == group]
@@ -25072,15 +25728,51 @@ class Handler(BaseHTTPRequestHandler):
             log("account %s disabled models: %s"
                 % (uid[:8],
                    ",".join(updated.get("disabledModels") or []) or "(none)"))
+        if "poolScope" in payload:
+            scope = payload.get("poolScope")
+            if not wb_pool_scope.is_valid_scope(scope):
+                return self._error(
+                    400, "poolScope must be 'text' or 'media'",
+                    "invalid_request_error")
+            updated = POOL.set_pool_scope(uid, scope)
+            if updated is None:
+                return self._error(404, "no such account")
+            log("account %s pool scope set to %s"
+                % (uid[:8], updated.get("poolScope")))
         if updated is None:
             return self._error(
                 400,
                 "nothing to update: pass 'enabled', 'tasksEnabled', 'proxy', "
-                "'proxySlot', 'weight', 'note' or 'group'"
+                "'proxySlot', 'weight', 'note', 'group', 'disabledModels' "
+                "or 'poolScope'"
             )
         return self._json_panel(200, {"account": updated})
 
     def _route_accounts_set_all(self, payload):
+        if "poolScope" in payload:
+            uids = payload.get("uids")
+            if not isinstance(uids, list) or not uids:
+                return self._error(
+                    400, "uids must be a non-empty list",
+                    "invalid_request_error")
+            scope = payload.get("poolScope")
+            if not wb_pool_scope.is_valid_scope(scope):
+                return self._error(
+                    400, "poolScope must be 'text' or 'media'",
+                    "invalid_request_error")
+            moved = POOL.set_pool_scope_many(
+                [str(uid) for uid in uids if uid], scope)
+            if moved is None:
+                return self._error(
+                    400, "poolScope must be 'text' or 'media'",
+                    "invalid_request_error")
+            log("accounts pool scope set to %s: %d account(s)"
+                % (wb_pool_scope.normalize_scope(scope), len(moved)))
+            return self._json_panel(200, {
+                "moved": len(moved),
+                "uids": moved,
+                "accounts": account_views(),
+            })
         group = str(payload.get("group") or "").strip()
         if group:
             raw_enabled = payload.get("enabled")
@@ -25845,6 +26537,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._panel_ok():
                 return self._error(401, "panel password required", "invalid_request_error")
             return self._handle_settings_save()
+        if path == "/settings/device-token/reload":
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            return self._route_device_token_reload()
         if path == "/settings/restriction/reset":
             if not self._panel_ok():
                 return self._error(401, "panel password required", "invalid_request_error")
@@ -25946,6 +26642,10 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/v1/videos/") and path.endswith("/cancel"):
             if not self._authorized():
                 return
+            if not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_MEDIA):
+                return self._error(
+                    403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                    "pool_boundary")
             self._handle_expect_continue()
             self._discard_body()
             task_id = path[len("/v1/videos/"):-len("/cancel")].strip("/")
@@ -25978,6 +26678,14 @@ class Handler(BaseHTTPRequestHandler):
                     401, "missing or invalid API key", "authentication_error")
         elif not self._authorized():
             return
+        if is_media_route and not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_MEDIA):
+            return self._error(
+                403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                "pool_boundary")
+        if not is_media_route and not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_TEXT):
+            return self._error(
+                503, "这个入口只服务图片 / 视频生成；文本模型请走文本号池的入口",
+                "pool_boundary")
         # Fail closed until the Anthropic-to-Chat bridge has verified prompt-cache
         # parity. Reject before forwarding or recording any paid usage.
         if is_messages_route and not _anthropic_messages_enabled():
@@ -25999,14 +26707,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if is_account_route:
             return self._handle_accounts(path, payload)
+        if is_media_route:
+            return self._handle_media_post(path, payload)
         try:
             aliases = wb_settings.model_aliases(ACCOUNTS_DIR)
         except Exception:
             aliases = {}
         _apply_model_aliases(payload, aliases)
         _apply_background_model_alias(payload)
-        if is_media_route:
-            return self._handle_media_post(path, payload)
         # Check per-key concurrency limit (#359)
         key_ok, cur_key_conc, max_key_conc = _acquire_key_slot(self.key_entry)
         if not key_ok:
@@ -26846,11 +27554,12 @@ def _bootstrap_runtime(args):
     POOL = wb_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()
     POOL.apply_proxy_slots()
+    _bind_pools()
     apply_reserve_credits()
     # WB_MAX_CONCURRENT_CHAT=auto: size the chat ceiling from the pool that was
     # just loaded. Runs before the listener exists, so no request can hold a
     # slot yet and the semaphore swap is safe.
-    resize_chat_slots(POOL.count_ready())
+    resize_chat_slots(TEXTS.count_ready() if TEXTS else 0)
     apply_daily_guards()
     load_persisted_realm()
     global SCHEDULER
@@ -26923,7 +27632,14 @@ def _report_first_run(args):
 
 def _log_startup_summary(args, api_key_generated):
     rep = current_account()
-    log("accounts   : %d total, %d usable" % (len(POOL.accounts), POOL.count_ready()))
+    texts, medias = _ensure_pools()
+    text_total = len(texts.accounts()) if texts else 0
+    media_total = len(medias.accounts()) if medias else 0
+    text_ready = texts.count_ready() if texts else 0
+    media_ready = medias.count_ready() if medias else 0
+    log("accounts   : %d total (文本号池 %d/%d, 媒体号池 %d/%d)"
+        % (len(POOL.accounts), text_ready, text_total,
+           media_ready, media_total))
     for account in POOL.accounts:
         log("  - %s  %s  %s  %s" % (account.uid[:8], account.nickname or "(no name)",
                                     account.domain, wb_accounts._human_delta(

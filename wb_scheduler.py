@@ -419,6 +419,7 @@ class Scheduler:
             self.log("账号池不可用，跳过本次巡检")
             return
         accounts = list(self.pool.accounts)
+
         if not accounts and not (
                 self._codearts_checkin_pending(run_checkin)
                 or self._codearts_keepalive_pending(run_keepalive)):
