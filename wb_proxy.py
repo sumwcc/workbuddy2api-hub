@@ -4137,7 +4137,7 @@ def remaining_priority_enabled():
 
 
 def affinity_stable_key_enabled():
-    """更稳的会话粘滞键开关（默认关，关着时与上游逻辑一字不差）。"""
+    """更稳的会话粘滞键开关（默认开；显式关闭时与旧逻辑一字不差）。"""
     return wb_settings.affinity_stable_key_enabled(ACCOUNTS_DIR) is True
 
 
@@ -11739,6 +11739,7 @@ def runtime_settings_view():
         "keep_backups": wb_settings.keep_backups(ACCOUNTS_DIR),
         "keep_backups_max": wb_settings.MAX_KEEP_BACKUPS,
         "upstream": _panel_upstream_config(ACCOUNTS_DIR),
+        "outbound_tls": wb_upstream_pool.tls_status(),
         "device_token_status": _panel_device_token_status(ACCOUNTS_DIR),
         "desktop_chat_compat": wb_settings.desktop_chat_compat(ACCOUNTS_DIR),
         "max_payload_mb": wb_settings.max_payload_mb(ACCOUNTS_DIR),
@@ -11754,7 +11755,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "2.0.6",
+        "version": "2.0.9",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -11868,8 +11869,8 @@ def affinity_route(messages):
     line share - they then overwrite each other's binding every turn and each
     turn lands on the other one's account, dropping the prefix cache each time.
     Adding the first assistant reply (and the user turn after it) makes the two
-    keys diverge from the second turn on. The switch is off by default so an
-    existing install keeps exactly the upstream behaviour and can roll back.
+    keys diverge from the second turn on. The switch is on by default; an
+    existing install can turn it off to restore the old key derivation.
     """
     if not AFFINITY_BY_PREFIX:
         return None, None
@@ -12245,6 +12246,7 @@ def log(msg, level=None, tag=None):
 
 # 本地网路工具的多引擎轮换、冷却与失败分类写进看板日志（tag=webtools）
 wb_webtools.set_logger(log)
+wb_upstream_pool.set_tls_logger(log)
 
 def get_logs(limit=200, level="", tag="", search="", since_id=0):
     # 落库开启时以数据库为准：它是完整历史（受保留上限约束），而内存环形缓冲
@@ -13321,21 +13323,25 @@ def normalize_roles(messages):
 # ---------------------------------------------------------------------------
 # Fingerprint Sanitization (immunizes against Codex / Claude Code WAF patterns)
 # ---------------------------------------------------------------------------
-SANITIZE_FEATURES = (
+# Claude Code 2.1.37+ 会把计费归因头作为 system 的第一个文本块发出来（#853）：
+#   x-anthropic-billing-header: cc_version=...; cc_entrypoint=...; cch=...; ...
+# 上游把 `x-anthropic-billing-header` 当保留关键字，出现即 400 / 11128。
+# v2.0.7 只登记了缩写 `...-hdr`，完整键名漏网，于是 2.0.3 可用、2.0.7 被拦截（#854）。
+SANITIZE_BILLING_HDR_NAMES = (
     "x-anthropic-billing-header",
-    "cc_entrypoint=",
+    "x-anthropic-billing-hdr",
+)
+SANITIZE_FEATURES = SANITIZE_BILLING_HDR_NAMES + (
     "You are Claude Code",
     "Main branch (",
     "You are a coding agent running in the Codex CLI",
     "github.com/anthropics/",
-    "11128",
 )
 SANITIZE_REWRITES = (
     ("Main branch (you will usually use this for PRs)",
      "Default branch (you will usually use this for PRs)"),
     ("To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
      "To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues"),
-    ("11128", "11-128"),
 )
 # Codex CLI 的自述首段（#743）：上游按「身份句 + Codex CLI」判 11-128。
 # 旧规则把中性句改写成这段自述，反过来把指纹注入出站 body；这里整句中性化，
@@ -13352,9 +13358,20 @@ SANITIZE_CLAUDE_CODE_INTRO_RE = re.compile(
     r"(?: tool)? for Claude(?: Code)?\.?")
 SANITIZE_CLAUDE_CODE_INTRO_REPLACEMENT = "You are a helpful AI assistant."
 SANITIZE_CLAUDE_CODE_LOWER = "you are claude code,"
-SANITIZE_HDR_RE = re.compile(r"(?i)x-anthropic-billing-header:[^;\r\n]*;?\s*")
-SANITIZE_BARE_HDR_RE = re.compile(r"(?i)x-anthropic-billing-header")
+# 真实形态是一整行，尾部还有 `cch=` 这类不以前缀 `cc_` 开头的参数；按行删除，
+# 避免只删到第一个分号后把 `x-anthropic-billing-header:` 留在出站文本里。
+SANITIZE_HDR_LINE_RE = re.compile(
+    r"(?im)^[ \t]*x-anthropic-billing-(?:header|hdr)[ \t]*:[^\r\n]*(?:\r?\n|$)")
+# 行首之外的嵌入形态（旧客户端 / 日志回放）仍按「键 + 首个值」删除，
+# 后续 `cc_*` 参数由 SANITIZE_KV_RE 清理。
+SANITIZE_HDR_RE = re.compile(
+    r"(?i)x-anthropic-billing-(?:header|hdr)\s*:\s*[^;\r\n]*(?:;\s*)?")
+SANITIZE_BARE_HDR_RE = re.compile(r"(?i)x-anthropic-billing-(?:header|hdr)")
 SANITIZE_KV_RE = re.compile(r"(?i)\bcc_[a-z0-9_]+=[^;\r\n]*;?\s*")
+SANITIZE_BILLING_LINE_RE = re.compile(
+    r"(?i)^[ \t]*x-anthropic-billing-(?:header|hdr)[ \t]*:(.*)$")
+SANITIZE_BILLING_CONT_RE = re.compile(
+    r"(?i)^(?:[ \t]*(?:cc_[a-z0-9_]+|cch)=[^;\r\n]*(?:;[ \t]*)?)+$")
 # WorkBuddy upstream returns 11128 ("Illegal API invocation from an unapproved
 # channel") when this exact OmO identity fingerprint appears as a contiguous
 # substring in a system message. A/B tests show the match is case-insensitive,
@@ -13445,28 +13462,29 @@ SANITIZE_BRAND_LOWER = "harness"
 # 归一化成基字母、再小写，副本上的 `in` 与 (?i) search 完全等价（多字符模式
 # 同样成立；全码点替换 + 定向用例 + 随机串对拍零差异，见 tests/_test_hotpath_savings.py）。
 SANITIZE_REI_FOLD = str.maketrans({0x130: "i", 0x131: "i", 0x17F: "s"})
-# 两个小写字面量直接从正则派生，保证与正则永远同源：手抄第二份迟早漂移，
-# 派生出来的值不存在这个问题。pattern 里的 (?i) 是内联旗标，剥掉后就是
-# 字面量本体。
-SANITIZE_BARE_HDR_LOWER = SANITIZE_BARE_HDR_RE.pattern
-if SANITIZE_BARE_HDR_LOWER.startswith("(?i)"):
-    SANITIZE_BARE_HDR_LOWER = SANITIZE_BARE_HDR_LOWER[4:]
+# 计费头有两个合法拼写（header / hdr），字面量快路径直接用登记表；
+# OMO 短语仍是单一字面量，继续从正则派生，保证与正则同源。
+SANITIZE_BARE_HDR_LOWER = SANITIZE_BILLING_HDR_NAMES[0]
+SANITIZE_BILLING_LOWER = tuple(name.lower() for name in SANITIZE_BILLING_HDR_NAMES)
 SANITIZE_OMO_JUNIOR_LOWER = SANITIZE_OMO_JUNIOR_RE.pattern.lower()
 SANITIZE_IDENTITY_LOWER = SANITIZE_IDENTITY_VERBS
-def has_fingerprint(text, identity=True):
+def has_fingerprint(text, identity=True, billing=True):
     if not isinstance(text, str) or not text:
         return False
-    for f in SANITIZE_FEATURES:
-        if f in text:
-            return True
     # 三个特例字符几乎从不出现：先做三次 C 速度探测，命中才走归一化副本，
     # 常规文本只付一次 lower()。
     if "\u0130" in text or "\u0131" in text or "\u017f" in text:
         low = text.translate(SANITIZE_REI_FOLD).lower()
     else:
         low = text.lower()
-    if (SANITIZE_BARE_HDR_LOWER in low
-            or SANITIZE_OMO_JUNIOR_LOWER in low):
+    for f in SANITIZE_FEATURES:
+        if not billing and f.lower() in SANITIZE_BILLING_LOWER:
+            continue
+        if f.lower() in low:
+            return True
+    if ((billing and SANITIZE_BARE_HDR_LOWER in low)
+            or SANITIZE_OMO_JUNIOR_LOWER in low
+            or (billing and "cc_" in low)):
         return True
     if not identity:
         return False
@@ -13492,10 +13510,77 @@ def has_fingerprint(text, identity=True):
     if not any(needle in low for needle in SANITIZE_IDENTITY_LOWER):
         return False
     return SANITIZE_IDENTITY_RE.search(text) is not None
-def sanitize_text(text, identity=True):
+
+
+def _billing_payload_is_metadata(value):
+    """True when a candidate header value contains only known metadata pairs."""
+    value = str(value or "").strip()
+    if not value:
+        return False
+    # Older clients emitted a bare version after the key.
+    if re.fullmatch(r"[0-9]+(?:\.[0-9A-Za-z_-]+){1,4}", value):
+        return True
+    pairs = [part.strip() for part in value.split(";") if part.strip()]
+    if not pairs:
+        return False
+    for pair in pairs:
+        if "=" not in pair:
+            return False
+        key, item = pair.split("=", 1)
+        key = key.strip().lower()
+        if not re.fullmatch(r"[a-z_][a-z0-9_]*", key):
+            return False
+        if key != "cch" and not key.startswith("cc_"):
+            return False
+        if not item.strip():
+            return False
+    return True
+
+
+def sanitize_billing_metadata_prefix(text):
+    """Remove only a leading, self-contained Claude Code billing block.
+
+    #853's metadata is a complete line (or a complete list of ``cc_*`` /
+    ``cch`` continuation lines) at the start of a system/developer block.  A
+    key mentioned in prose, a fenced example, a user message or a tool result
+    is not enough to trigger this cleaner.
+    """
     if not isinstance(text, str) or not text:
         return text
-    if not has_fingerprint(text, identity=identity):
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+    first = lines[0].rstrip("\r\n")
+    match = SANITIZE_BILLING_LINE_RE.fullmatch(first)
+    if match is None or not _billing_payload_is_metadata(match.group(1)):
+        return text
+    end = 1
+    while end < len(lines):
+        candidate = lines[end].rstrip("\r\n")
+        if not SANITIZE_BILLING_CONT_RE.fullmatch(candidate):
+            break
+        end += 1
+    return "".join(lines[end:]).strip()
+
+
+def sanitize_message_text(text, identity=True, billing=False):
+    """Sanitize one message text without applying legacy broad header cleanup.
+
+    The unscoped ``sanitize_text`` entry point remains available for existing
+    callers and tests, but the wire-body pipeline uses this wrapper so billing
+    metadata can only be removed in system/developer messages and only from a
+    fully recognisable leading block.
+    """
+    cleaned = sanitize_text(text, identity=identity, billing=False)
+    if billing:
+        cleaned = sanitize_billing_metadata_prefix(cleaned)
+    return cleaned
+
+
+def sanitize_text(text, identity=True, billing=True):
+    if not isinstance(text, str) or not text:
+        return text
+    if not has_fingerprint(text, identity=identity, billing=billing):
         return text
     # Keep the rewrite deliberately narrow: do not globally remove
     # "OhMyOpenCode" or "Sisyphus-Junior", because either token alone is
@@ -13517,23 +13602,35 @@ def sanitize_text(text, identity=True):
         text = SANITIZE_BRAND_RE.sub(SANITIZE_BRAND_REPLACEMENT, text)
     for old, new in SANITIZE_REWRITES:
         text = text.replace(old, new)
-    text = SANITIZE_HDR_RE.sub("", text)
-    if "cc_" in text:
-        prev = ""
-        while prev != text:
-            prev = text
-            text = SANITIZE_KV_RE.sub("", text)
-    text = SANITIZE_BARE_HDR_RE.sub("x-anthropic-billing-hdr", text)
+    if billing:
+        # Preserve the historical unscoped entry point. Message processing
+        # passes billing=False and uses sanitize_billing_metadata_prefix().
+        text = SANITIZE_HDR_LINE_RE.sub("", text)
+        text = SANITIZE_HDR_RE.sub("", text)
+        if "cc_" in text:
+            prev = ""
+            while prev != text:
+                prev = text
+                text = SANITIZE_KV_RE.sub("", text)
+        # The bare header is the last rewrite: has_fingerprint() matches this
+        # exact key, so replacing it earlier would leave a value the fast path
+        # ignores.
+        text = SANITIZE_BARE_HDR_RE.sub("anthropic-header", text)
     return text.strip()
-def sanitize_content(content, identity=True):
+
+
+def sanitize_content(content, identity=True, billing=False):
     if isinstance(content, str):
-        return sanitize_text(content, identity=identity)
+        return sanitize_message_text(content, identity=identity, billing=billing)
     if isinstance(content, list):
         out = []
         for part in content:
             if isinstance(part, dict) and part.get("type") == "text" and "text" in part:
                 p = dict(part)
-                p["text"] = sanitize_text(p["text"], identity=identity)
+                p["text"] = sanitize_message_text(
+                    p["text"], identity=identity, billing=billing)
+                if billing and not p["text"]:
+                    continue
                 out.append(p)
             else:
                 out.append(part)
@@ -13562,7 +13659,8 @@ def sanitize_tools(tools):
             fn = dict(fn)
             desc = fn.get("description")
             if isinstance(desc, str):
-                fn["description"] = sanitize_text(desc, identity=True)
+                fn["description"] = sanitize_text(
+                    desc, identity=True, billing=False)
             item["function"] = fn
         out.append(item)
     return out
@@ -13586,7 +13684,9 @@ def sanitize_tool_calls(tool_calls):
                 raw_args = fn.get("arguments")
                 if isinstance(raw_args, str):
                     fn["arguments"] = (raw_args if preserve
-                                       else sanitize_text(raw_args, identity=False))
+                                       else sanitize_text(
+                                           raw_args, identity=False,
+                                           billing=False))
                 elif raw_args is None:
                     fn["arguments"] = "{}"
                 else:
@@ -13613,15 +13713,37 @@ def sanitize_messages(messages):
             # assistant 里 400/400/400，放在 user 里 200/200/200）。user / tool
             # 仍是用户数据，不改写。
             identity = item.get("role") in ("system", "developer", "assistant")
+            billing = item.get("role") in ("system", "developer")
             if "content" in item and not preserve_tool_result:
+                before = item.get("content")
                 item["content"] = sanitize_content(item["content"],
-                                                   identity=identity)
+                                                   identity=identity,
+                                                   billing=billing)
+                # 整条 system 文本或文本块数组可能只有计费归因头；清洗后为空
+                # 就直接丢掉，避免把空 system 消息发给上游（空文本段会 400 /
+                # 11151）。图片等非文本块不参与这个判定。
+                had_text = (
+                    isinstance(before, str) and bool(before.strip())
+                ) or (
+                    isinstance(before, list)
+                    and any(
+                        isinstance(part, dict)
+                        and part.get("type") == "text"
+                        and isinstance(part.get("text"), str)
+                        and bool(part["text"].strip())
+                        for part in before
+                    )
+                )
+                if (item.get("role") in ("system", "developer")
+                        and had_text
+                        and item["content"] in ("", [])):
+                    continue
             if isinstance(item.get("reasoning_content"), str):
                 item["reasoning_content"] = sanitize_text(
-                    item["reasoning_content"], identity=False)
+                    item["reasoning_content"], identity=False, billing=False)
             if not preserve_request_contract_enabled() and isinstance(item.get("reasoning"), str):
                 item["reasoning"] = sanitize_text(
-                    item["reasoning"], identity=False)
+                    item["reasoning"], identity=False, billing=False)
             if "tool_calls" in item:
                 item["tool_calls"] = sanitize_tool_calls(item["tool_calls"])
             out.append(item)
@@ -21031,7 +21153,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/2.0.6"
+    server_version = "wb-proxy/2.0.9"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -21871,6 +21993,7 @@ class Handler(BaseHTTPRequestHandler):
             "panel_password_is_default": wb_settings.panel_password_is_default(ACCOUNTS_DIR),
             "authenticated": self._panel_ok(),
             "crypto_ok": crypto_ok,
+            "outbound_tls": wb_upstream_pool.tls_status(),
         }
         if not crypto_ok:
             info["crypto_error"] = crypto_reason
@@ -21919,6 +22042,7 @@ class Handler(BaseHTTPRequestHandler):
             # literal "intl" and drifted from the panel switch.
             "realm": CURRENT_REALM,
             "crypto_ok": crypto_ok,
+            "outbound_tls": wb_upstream_pool.tls_status(),
         }
         if not crypto_ok:
             info["crypto_error"] = crypto_reason
@@ -22504,12 +22628,14 @@ class Handler(BaseHTTPRequestHandler):
                 # Cache-Control 必须原样重发（RFC 7232 §4.1），否则缓存会丢掉状态。
                 self.send_response(304)
                 self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
                 self.send_header("ETag", etag)
                 self.end_headers()
                 return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Robots-Tag", "noindex, nofollow")
         # no-cache 而不是 no-store：允许存储，但每次使用前必须回源校验；配合
         # 上面的校验符，校验命中的代价是一次 304 而不是整页约 470KB。不加
         # max-age：没有它浏览器每次打开都会校验，应用更新后新版页面立即生效。

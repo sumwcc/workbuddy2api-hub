@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
 <title>WorkBuddy 控制台</title>
 <!-- 首帧判定：必须留在 <head>、在任何页面内容之前同步执行。
      没有面板会话令牌（无痕 / 首次访问 / 已登出）→ 不动 markup 上的 display:flex，
@@ -307,6 +308,22 @@ table.account-cards td[data-label="账号"] .cool-pill{display:block;width:100%;
 @media (min-width:641px){
   table.account-cards{table-layout:fixed;min-width:1262px}
   table.account-cards th:nth-child(2),table.account-cards td:nth-child(2){width:180px}
+  /* 账号表横向滚动时，左侧「版本 / 账号」两列必须跟右侧「操作」列一样钉住。
+     否则滚到最右边后账号名会被推出容器，只剩下一排认不出归属的数据。
+     排除 cool-row：它是 colspan 整行告警，不是普通账号行的第一列。 */
+  table.account-cards th:nth-child(1),
+  table.account-cards tbody tr:not(.cool-row) td:nth-child(1){
+    position:sticky;left:0;z-index:3;background:var(--panel);
+  }
+  table.account-cards th:nth-child(2),
+  table.account-cards tbody tr:not(.cool-row) td:nth-child(2){
+    position:sticky;left:76px;z-index:3;background:var(--panel);
+    box-shadow:1px 0 0 var(--line);
+  }
+  table.account-cards th:nth-child(1),
+  table.account-cards th:nth-child(2){z-index:4;background:var(--panel2)}
+  table.account-cards tbody tr:not(.cool-row):hover td:nth-child(1),
+  table.account-cards tbody tr:not(.cool-row):hover td:nth-child(2){background:var(--panel2)}
   table.account-cards td.acct-actions{white-space:normal;min-width:232px;width:232px;position:sticky;right:0;z-index:2;background:var(--panel);box-shadow:-8px 0 12px -12px rgba(31,30,27,.55)}
   table.account-cards th:last-child{position:sticky;right:0;z-index:3;background:var(--panel2);box-shadow:-8px 0 12px -12px rgba(31,30,27,.55)}
   table.account-cards tbody tr:hover td.acct-actions{background:var(--panel2)}
@@ -316,6 +333,10 @@ table.account-cards td[data-label="账号"] .cool-pill{display:block;width:100%;
 }
 @media (max-width:640px){
   table.account-cards{min-width:0!important;table-layout:auto}
+  table.account-cards th:nth-child(1),
+  table.account-cards th:nth-child(2),
+  table.account-cards td:nth-child(1),
+  table.account-cards td:nth-child(2){position:static;left:auto;z-index:auto;background:transparent;box-shadow:none}
   table.account-cards th:last-child,table.account-cards td.acct-actions{position:static;min-width:0;width:auto;z-index:auto;box-shadow:none}
   table.account-cards td[data-label="积分"]{white-space:normal;align-items:flex-start}
   table.account-cards .credit-stack{width:100%;align-items:flex-start}
@@ -2445,6 +2466,18 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     'CodeArts 账号': 'CodeArts accounts',
     'CodeArts 接入': 'CodeArts',
     'CodeArts 出口': 'CodeArts exit',
+    '出站 TLS 状态': 'Outbound TLS status',
+    '默认 auto：优先使用随包 Go/uTLS 桥，不可用时自动回退 Python/OpenSSL。这里只显示脱敏状态；桥认证密钥、代理凭据和账号 token 不会返回浏览器。': 'Default auto: prefer the bundled Go/uTLS bridge and fall back to Python/OpenSSL when it is unavailable. Only redacted status is shown here; the bridge secret, proxy credentials and account tokens are never sent to the browser.',
+    '请求模式': 'Requested mode',
+    '桥状态': 'Bridge state',
+    '最近路线': 'Last route',
+    '最近回退': 'Last fallback',
+    '自动重试': 'Auto retry',
+    '最近回退时间：': 'Last fallback: ',
+    '(只读)': '(read-only)',
+    '(不可用)': '(unavailable)',
+    '可用': 'Available',
+    '不可用': 'Unavailable',
     '启用 CodeArts 出口': 'Enable the CodeArts exit',
     '每天自动签到': 'Daily auto check-in',
     '添加 CodeArts 账号': 'Add a CodeArts account',
@@ -4153,6 +4186,18 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     "智能体接入": "智能體接入",
     "网关设置": "閘道設定",
     "面板窗口限高": "面板視窗限高",
+    "出站 TLS 状态": "出站 TLS 狀態",
+    "默认 auto：优先使用随包 Go/uTLS 桥，不可用时自动回退 Python/OpenSSL。这里只显示脱敏状态；桥认证密钥、代理凭据和账号 token 不会返回浏览器。": "預設 auto：優先使用隨包 Go/uTLS 橋，不可用時自動回退 Python/OpenSSL。這裡只顯示去識別化狀態；橋認證金鑰、代理憑據和帳號 token 不會返回瀏覽器。",
+    "请求模式": "請求模式",
+    "桥状态": "橋狀態",
+    "最近路线": "最近路線",
+    "最近回退": "最近回退",
+    "自动重试": "自動重試",
+    "最近回退时间：": "最近回退時間：",
+    "(只读)": "(唯讀)",
+    "(不可用)": "(無法取得)",
+    "可用": "可用",
+    "不可用": "不可用",
     "每个窗口（区块）超过这个高度时在窗口内部滚动，不再把整页拉长；滚动时标题行固定在窗口顶部。单位像素；填 0 表示不限。": "每個視窗（區塊）超過這個高度時在視窗內部捲動，不再把整頁拉長；捲動時標題列固定在視窗頂部。單位像素；填 0 表示不限。",
     "窗口最高高度（像素，0 = 不限）": "視窗最高高度（像素，0 = 不限）",
     "已限高：窗口最高 ": "已限高：視窗最高 ",
@@ -6314,11 +6359,11 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
     </div>
     <!-- 二级分类胶囊导航 -->
     <div id="settingsCatBar" class="settings-cat-bar">
-      <button type="button" class="settings-cat-btn active" data-cat="all" onclick="filterSettingsCategory('all')">全部 <span class="cat-count">36</span></button>
+      <button type="button" class="settings-cat-btn active" data-cat="all" onclick="filterSettingsCategory('all')">全部 <span class="cat-count">37</span></button>
       <button type="button" class="settings-cat-btn" data-cat="access" onclick="filterSettingsCategory('access')">🔑 访问与密钥 <span class="cat-count">6</span></button>
       <button type="button" class="settings-cat-btn" data-cat="models" onclick="filterSettingsCategory('models')">🤖 模型与调度 <span class="cat-count">10</span></button>
       <button type="button" class="settings-cat-btn" data-cat="limits" onclick="filterSettingsCategory('limits')">🛡️ 限额与并发 <span class="cat-count">4</span></button>
-      <button type="button" class="settings-cat-btn" data-cat="network" onclick="filterSettingsCategory('network')">🌐 出口与网络 <span class="cat-count">7</span></button>
+      <button type="button" class="settings-cat-btn" data-cat="network" onclick="filterSettingsCategory('network')">🌐 出口与网络 <span class="cat-count">8</span></button>
       <button type="button" class="settings-cat-btn" data-cat="tasks" onclick="filterSettingsCategory('tasks')">⏰ 自动化 <span class="cat-count">3</span></button>
       <button type="button" class="settings-cat-btn" data-cat="system" onclick="filterSettingsCategory('system')">🛠️ 计费与运维 <span class="cat-count">6</span></button>
     </div>
@@ -6480,6 +6525,22 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
         <button class="sec" onclick="testCodeartsConnection(this)">测试连接</button>
         <span id="setCodeartsHint" style="font-size:12px;color:var(--dim)"></span>
       </div>
+    </section>
+
+    <section data-cat="network">
+      <h2>出站 TLS 状态 <em id="setOutboundTlsState"></em></h2>
+      <div style="font-size:12px;color:var(--dim);margin-bottom:12px">
+        默认 auto：优先使用随包 Go/uTLS 桥，不可用时自动回退 Python/OpenSSL。
+        这里只显示脱敏状态；桥认证密钥、代理凭据和账号 token 不会返回浏览器。
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">
+        <div><div style="font-size:12px;color:var(--dim);margin-bottom:4px">请求模式</div><b id="setOutboundTlsMode" class="mono">-</b></div>
+        <div><div style="font-size:12px;color:var(--dim);margin-bottom:4px">桥状态</div><b id="setOutboundTlsBridge" class="mono">-</b></div>
+        <div><div style="font-size:12px;color:var(--dim);margin-bottom:4px">最近路线</div><b id="setOutboundTlsRoute" class="mono">-</b></div>
+        <div><div style="font-size:12px;color:var(--dim);margin-bottom:4px">最近回退</div><b id="setOutboundTlsFallback" class="mono">-</b></div>
+        <div><div style="font-size:12px;color:var(--dim);margin-bottom:4px">自动重试</div><b id="setOutboundTlsRetry" class="mono">-</b></div>
+      </div>
+      <div id="setOutboundTlsWhen" style="font-size:11px;color:var(--dim);margin-top:10px"></div>
     </section>
 
     <section data-cat="network">
@@ -7306,7 +7367,7 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
           <div>
             <h2 style="margin:0">更稳的会话粘滞键 <span class="help-mark" role="button" tabindex="0" aria-label="功能说明" onclick="toggleHelpDetail('affinityStableKeyHelp', event)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleHelpDetail('affinityStableKeyHelp', event);}">!</span> <em id="setAffinityStableKeyState"></em></h2>
             <div class="help-detail" id="affinityStableKeyHelp" hidden>
-              会话粘滞（同一段对话每轮回到同一个账号）默认只用「system 提示 + 首条提问」算会话键。两个开场白相同的会话会算出同一个键、共享同一个绑定槽，于是每轮互相覆盖、轮流换账号，缓存每轮归零。开启后把「首条 assistant 回复」也算进键里，两个会话从第 2 轮起各走各的账号。默认关闭，关着时与上游逻辑一字不差。
+              会话粘滞（同一段对话每轮回到同一个账号）默认把「system 提示 + 首条提问 + 首条 assistant 回复」算进会话键。两个开场白相同的会话从第 2 轮起会各走各的账号，避免共享绑定槽后互相覆盖、轮流换账号，导致缓存每轮归零。可关闭此开关恢复旧的两条消息会话键。
               <br><br>
               代价：前缀真的完全相同的会话仍会共用一个账号（那本来就是最优的缓存共享）；开启后前两条消息的哈希变成前三条，正在进行的对话会一次性重新绑定账号（那一轮缓存掉一次）。
             </div>
@@ -15037,9 +15098,29 @@ async function saveWinMaxHeight(btn){
 }
 // ==== 面板窗口限高结束 ====
 
+function applyOutboundTlsStatus(tls){
+  const info = (tls && typeof tls === 'object') ? tls : {};
+  const put = (id, value) => {
+    const node = document.getElementById(id);
+    if(node) node.textContent = (value === undefined || value === null || value === '') ? '-' : String(value);
+  };
+  const state = document.getElementById('setOutboundTlsState');
+  if(state) state.textContent = tls ? '(只读)' : '(不可用)';
+  put('setOutboundTlsMode', info.requested_mode || '-');
+  put('setOutboundTlsBridge', info.bridge_state || '-');
+  put('setOutboundTlsRoute', info.last_route || '-');
+  const reason = info.last_fallback_reason || '';
+  put('setOutboundTlsFallback', reason || '-');
+  put('setOutboundTlsRetry', info.auto_retry_available ? '可用' : '不可用');
+  const when = document.getElementById('setOutboundTlsWhen');
+  if(when) when.textContent = info.last_fallback_at
+    ? ('最近回退时间：' + info.last_fallback_at) : '';
+}
+
 async function loadSettings(showToast, opts){
   try {
     const data = await getJSON('/settings');
+    applyOutboundTlsStatus(data.outbound_tls);
     const pwdState = document.getElementById('setPwdState');
     if(pwdState){
       pwdState.textContent = data.panel_password_is_default ? '(当前为默认密码)' : '(已自定义)';
@@ -22285,7 +22366,7 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
     api: {
       title: 'API 与出口',
       desc: 'API Key、CodeArts、代理槽、账号限额和出站身份。',
-      items: ['API Key', 'CodeArts 接入', '账号代理槽', '账号限额', '自动切换出站身份', '出站身份版本号', '设备 Token 文件', '桌面 chat 兼容头', '跨出口回退']
+      items: ['API Key', 'CodeArts 接入', '出站 TLS 状态', '账号代理槽', '账号限额', '自动切换出站身份', '出站身份版本号', '设备 Token 文件', '桌面 chat 兼容头', '跨出口回退']
     },
     model: {
       title: '模型与定价',
