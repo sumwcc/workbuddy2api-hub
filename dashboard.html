@@ -9340,6 +9340,85 @@ function taskActive(a){
   return !!a && (a.tasksEnabled !== undefined ? !!a.tasksEnabled : !!a.enabled);
 }
 
+/* 账号下拉的两项附加信息：
+ *  - 剩余积分：服务端账号缓存里的 credits.remain，本地读取零成本；
+ *  - 任务进度：`/tasks` 直接带的缓存值，缺的那部分由 fillGrowthProgress()
+ *    分批向 /tasks/progress 要，回来原地改写对应 option，不阻塞首屏。
+ * 切账号会重建下拉，所以已知值存在 Map 里，重建时继续用。 */
+const GROWTH_PROGRESS = new Map();   // uid -> {done, total}
+const GROWTH_CREDITS = new Map();    // uid -> 剩余积分
+const GROWTH_ACCOUNTS = new Map();   // uid -> 账号（重建 option 文本要用昵称）
+let GROWTH_FILL_GEN = 0;
+
+function growthAccountLabel(a){
+  const credit = GROWTH_CREDITS.has(a.uid) ? GROWTH_CREDITS.get(a.uid) : a.credits_remain;
+  const prog = GROWTH_PROGRESS.get(a.uid);
+  const bits = [];
+  if(credit !== null && credit !== undefined && isFinite(Number(credit))){
+    bits.push('剩余 ' + fmt(Number(credit)) + ' 积分');
+  }
+  bits.push('任务 ' + (prog && prog.total ? (prog.done + '/' + prog.total) : '—'));
+  const nick = String(a.nickname || a.uid || '');
+  return nick + ' (' + String(a.uid || '').slice(0, 6) + ') · ' + bits.join(' · ');
+}
+
+function renderGrowthAccounts(accts){
+  const sel = document.getElementById("growthAcctSelect");
+  if(!sel) return;
+  if(!accts.length){ sel.innerHTML = '<option value="">无国内版账号</option>'; return; }
+  GROWTH_ACCOUNTS.clear();
+  let totalCredit = 0, hasCredit = false;
+  accts.forEach(a => {
+    GROWTH_ACCOUNTS.set(a.uid, a);
+    if(a.tasks_total) GROWTH_PROGRESS.set(a.uid, {done: a.tasks_done || 0, total: a.tasks_total});
+    const credit = (a.credits_remain === null || a.credits_remain === undefined) ? null : Number(a.credits_remain);
+    if(credit !== null && isFinite(credit)){
+      GROWTH_CREDITS.set(a.uid, credit);
+      totalCredit += credit;
+      hasCredit = true;
+    }
+  });
+  const allLabel = '全部国内账号 (批量)' + (hasCredit ? ' · 剩余 ' + fmt(totalCredit) + ' 积分' : '');
+  sel.innerHTML = '<option value="all"' + (CURRENT_GROWTH_UID === 'all' ? ' selected' : '') + '>' + allLabel + '</option>'
+    + accts.map(a => '<option value="' + esc(a.uid) + '"' + (CURRENT_GROWTH_UID === a.uid ? ' selected' : '') + '>' + esc(growthAccountLabel(a)) + '</option>')
+      .join('');
+}
+
+function updateGrowthOption(uid){
+  const sel = document.getElementById("growthAcctSelect");
+  const account = GROWTH_ACCOUNTS.get(uid);
+  if(!sel || !account) return;
+  const opt = Array.prototype.find.call(sel.options, o => o.value === uid);
+  if(!opt) return;
+  const label = growthAccountLabel(account);
+  if(opt.textContent !== label) opt.textContent = label;
+}
+
+/* 只补没有进度的账号：每批 6 个，批间让 120ms，服务端 3 并发问上游。
+ * 换账号/离开页面会重建下拉并递增代次号，旧批次回来直接丢弃。 */
+async function fillGrowthProgress(accts){
+  const gen = ++GROWTH_FILL_GEN;
+  const missing = accts.filter(a => {
+    const prog = GROWTH_PROGRESS.get(a.uid);
+    return !(prog && prog.total);
+  }).map(a => a.uid);
+  for(let i = 0; i < missing.length; i += 6){
+    let r = null;
+    try{
+      r = await getJSON('/tasks/progress?uids=' + encodeURIComponent(missing.slice(i, i + 6).join(',')));
+    }catch(e){
+      // 单批失败不阻塞后面的批次，下次进页面再补。
+    }
+    if(gen !== GROWTH_FILL_GEN) return;
+    ((r && r.items) || []).forEach(item => {
+      if(!item || !item.uid || !item.total) return;
+      GROWTH_PROGRESS.set(item.uid, {done: item.done || 0, total: item.total});
+      updateGrowthOption(item.uid);
+    });
+    if(i + 6 < missing.length) await new Promise(res => setTimeout(res, 120));
+  }
+}
+
 async function loadIntlTasks(){
   try{
     const [r, g] = await Promise.all([
@@ -9380,17 +9459,8 @@ async function loadGrowthTasks(){
     const energy = sum.energy || 0;
     const tr = sum.travel || {};
 
-    const sel = document.getElementById("growthAcctSelect");
-    if(sel){
-      if(accts.length){
-        const opts = ['<option value="all"' + (CURRENT_GROWTH_UID === 'all' ? ' selected' : '') + '>全部国内账号 (批量)</option>']
-          .concat(accts.map(a => '<option value="' + esc(a.uid) + '"' + (CURRENT_GROWTH_UID === a.uid ? ' selected' : '') + '>' + esc(a.nickname) + ' (' + esc(a.uid.slice(0,6)) + ')</option>'))
-          .join('');
-        sel.innerHTML = opts;
-      } else {
-        sel.innerHTML = '<option value="">无国内版账号</option>';
-      }
-    }
+    renderGrowthAccounts(accts);
+    if(accts.length) fillGrowthProgress(accts);
     if(!accts.length){
       if(typeof updateTaskPageCheckinCards === 'function') updateTaskPageCheckinCards();
       const elStk = document.getElementById("stkDays"); if(elStk) elStk.textContent = '-';

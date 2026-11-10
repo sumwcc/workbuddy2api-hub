@@ -7307,6 +7307,81 @@ def invalidate_tasks_cache():
     """任务状态变了就清掉快照，下一次读重新向上游取。"""
     with _tasks_cache_lock:
         _tasks_cache.clear()
+    with _tasks_progress_lock:
+        _tasks_progress_cache.clear()
+
+
+# ------------------------------------------------------- 任务进度（下拉里的 13/18）
+# 任务状态没有批量接口，只能按账号问上游（每账号一次，约 1~1.5 秒）。面板的账号
+# 下拉要给每个账号标「已完成 N/M」，一百多个账号逐个现问显然不行，而且任务一天
+# 只变一次：这里按 uid 缓存进度，TTL 默认 6 小时，面板首屏只读缓存、缺的那部分
+# 由前端分批来补（GET /tasks/progress），每批最多 6 个账号、后端 3 并发。
+TASK_PROGRESS_TTL = float(os.environ.get("WB_TASK_PROGRESS_TTL") or "21600")
+TASK_PROGRESS_BATCH = 6
+_tasks_progress_cache = {}
+_tasks_progress_lock = threading.Lock()
+
+
+def task_progress_counts(tasks):
+    """完成数 / 总数。claimed、completed、进度达标都算「已达成」。
+
+    与任务表格里的徽章口径一致：已领取与待领奖都是达成，只有进度没跑满的
+    才算未完成。
+    """
+    rows = tasks or []
+    done = 0
+    for item in rows:
+        if item.get("status") in ("claimed", "completed"):
+            done += 1
+            continue
+        try:
+            current = float(item.get("current") or 0)
+            target = float(item.get("target") or 0)
+        except (TypeError, ValueError):
+            continue
+        if target > 0 and current >= target:
+            done += 1
+    return done, len(rows)
+
+
+def record_task_progress(uid, tasks):
+    if not uid:
+        return None
+    rows = tasks or []
+    if not rows:
+        # 空列表多半是上游查询失败（fetch_growth_tasks 会把异常吞成 []），
+        # 不能拿它覆盖已知的好进度，否则下拉会突然从 13/18 变回「—」。
+        return None
+    done, total = task_progress_counts(rows)
+    entry = {"done": done, "total": total, "at": time.time()}
+    with _tasks_progress_lock:
+        _tasks_progress_cache[uid] = entry
+    return entry
+
+
+def task_progress_entry(uid):
+    """未过期的进度；没缓存或已过期给 None。"""
+    if not uid:
+        return None
+    with _tasks_progress_lock:
+        entry = _tasks_progress_cache.get(uid)
+    if not entry:
+        return None
+    if entry["at"] + TASK_PROGRESS_TTL <= time.time():
+        return None
+    return entry
+
+
+def credits_remain_of(account):
+    """账号缓存的剩余积分；没有这份数据就返回 None（不是 0）。"""
+    credits = getattr(account, "credits", None)
+    if not isinstance(credits, dict):
+        return None
+    value = credits.get("remain")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 def growth_snapshot(account):
     """成长任务 + 汇总；TTL 内直接复用上一份快照，过期或没缓存才请求上游。
@@ -21950,6 +22025,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_activity_history(query)
         if path == "/tasks":
             return self._get_tasks(query)
+        if path == "/tasks/progress":
+            return self._get_tasks_progress(query)
         if path == "/scheduler":
             return self._get_scheduler()
         if path == "/pricing":
@@ -22439,13 +22516,80 @@ class Handler(BaseHTTPRequestHandler):
         if not acc:
             acc = cn_accounts[0]
         tasks, summary = growth_snapshot(acc)
-        acct_list = [{"uid": a.uid, "nickname": a.nickname or a.uid[:8]} for a in cn_accounts]
+        record_task_progress(acc.uid, tasks)
+        acct_list = []
+        for a in cn_accounts:
+            entry = task_progress_entry(a.uid)
+            acct_list.append({
+                "uid": a.uid,
+                "nickname": a.nickname or a.uid[:8],
+                "credits_remain": credits_remain_of(a),
+                "tasks_done": entry["done"] if entry else None,
+                "tasks_total": entry["total"] if entry else None,
+                "progress_at": int(entry["at"]) if entry else None,
+            })
         return self._json_panel(200, {
             "tasks": tasks,
             "summary": summary,
             "account": acc.public(),
             "accounts": acct_list,
         })
+
+    def _get_tasks_progress(self, query):
+        """`GET /tasks/progress?uids=a,b,c`：下拉里的「已完成 13/18」。
+
+        只补缓存里没有的账号：每批最多 6 个、3 并发问上游，单个账号失败只把
+        这一项标成 error，不影响同批其它账号。写进 TTL 缓存后，面板再开就
+        不用再问上游。
+        """
+        if not self._authorized():
+            return
+        raw = (query.get("uids") or [""])[0]
+        wanted = []
+        for uid in str(raw).split(","):
+            uid = uid.strip()
+            if uid and uid not in wanted:
+                wanted.append(uid)
+        accounts = POOL.task_accounts("cn") if POOL else []
+        by_uid = {a.uid: a for a in accounts}
+        # 先按真实账号过滤再截断：列表里带了失效 uid 时不能白占一个名额。
+        targets = [by_uid[uid] for uid in wanted if uid in by_uid][:TASK_PROGRESS_BATCH]
+        items = []
+        pending = []
+        for account in targets:
+            uid = account.uid
+            entry = task_progress_entry(uid)
+            if entry:
+                items.append({"uid": uid, "done": entry["done"],
+                              "total": entry["total"],
+                              "updated_at": int(entry["at"]),
+                              "state": "cached"})
+            else:
+                pending.append(account)
+        if pending:
+            from concurrent.futures import ThreadPoolExecutor
+            from wb_tasks import fetch_growth_tasks
+
+            def _fetch(account):
+                try:
+                    return account, fetch_growth_tasks(account), ""
+                except Exception as exc:  # 单账号失败不拖垮整批
+                    return account, None, str(exc)[:120]
+
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                for account, tasks, error in pool.map(_fetch, pending):
+                    if tasks is None:
+                        items.append({"uid": account.uid, "done": None,
+                                      "total": None, "updated_at": None,
+                                      "state": "error", "error": error})
+                        continue
+                    now = time.time()
+                    record_task_progress(account.uid, tasks)
+                    done, total = task_progress_counts(tasks)
+                    items.append({"uid": account.uid, "done": done,
+                                  "total": total, "updated_at": int(now),
+                                  "state": "fetched"})
+        return self._json_panel(200, {"items": items})
 
     def _get_scheduler(self):
         if not self._authorized():
