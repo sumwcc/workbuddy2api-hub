@@ -7309,6 +7309,7 @@ def invalidate_tasks_cache():
         _tasks_cache.clear()
     with _tasks_progress_lock:
         _tasks_progress_cache.clear()
+    save_task_progress()
 
 
 # ------------------------------------------------------- 任务进度（下拉里的 13/18）
@@ -7347,6 +7348,7 @@ def task_progress_counts(tasks):
 def record_task_progress(uid, tasks):
     if not uid:
         return None
+    load_task_progress()
     rows = tasks or []
     if not rows:
         # 空列表多半是上游查询失败（fetch_growth_tasks 会把异常吞成 []），
@@ -7363,6 +7365,7 @@ def task_progress_entry(uid):
     """未过期的进度；没缓存或已过期给 None。"""
     if not uid:
         return None
+    load_task_progress()
     with _tasks_progress_lock:
         entry = _tasks_progress_cache.get(uid)
     if not entry:
@@ -7382,6 +7385,83 @@ def credits_remain_of(account):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+# ---- 进度落盘 ----
+# 只放内存的话，蓝绿发布会把一百多个账号的进度清零，下一次开面板又要逐个问
+# 上游。这里存成 `usage/task-progress.json`（发布用的 rsync 已排除 usage/），
+# 原子写 + 版本号；文件坏了、版本不符、条目过期都当作没有，重新问上游即可。
+TASK_PROGRESS_FILE = "task-progress.json"
+TASK_PROGRESS_VERSION = 1
+_tasks_progress_loaded = False
+_tasks_progress_last_payload = None
+
+
+def task_progress_path():
+    return os.path.join(USAGE_DIR, TASK_PROGRESS_FILE)
+
+
+def load_task_progress():
+    """懒加载落盘缓存。只信版本一致、未过期、结构正确的条目。"""
+    global _tasks_progress_loaded
+    if _tasks_progress_loaded:
+        return
+    _tasks_progress_loaded = True
+    try:
+        with open(task_progress_path(), encoding="utf-8-sig") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return
+    except Exception:
+        # 坏文件不该拖垮网关：当作没有缓存，重新向上游取。
+        return
+    if not isinstance(raw, dict) or raw.get("version") != TASK_PROGRESS_VERSION:
+        return
+    items = raw.get("items")
+    if not isinstance(items, dict):
+        return
+    now = time.time()
+    with _tasks_progress_lock:
+        for uid, item in items.items():
+            if not isinstance(item, dict):
+                continue
+            try:
+                done = int(item["done"])
+                total = int(item["total"])
+                at = float(item["at"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if total <= 0 or at + TASK_PROGRESS_TTL <= now:
+                continue
+            _tasks_progress_cache[str(uid)] = {"done": done, "total": total, "at": at}
+
+
+def save_task_progress():
+    """原子落盘；内容没变就不重写。写失败只丢持久化，不影响请求。"""
+    global _tasks_progress_last_payload
+    now = time.time()
+    with _tasks_progress_lock:
+        items = {}
+        for uid, item in _tasks_progress_cache.items():
+            if item["total"] <= 0 or item["at"] + TASK_PROGRESS_TTL <= now:
+                continue
+            items[uid] = {"done": item["done"], "total": item["total"],
+                          "at": item["at"]}
+    payload = json.dumps({"version": TASK_PROGRESS_VERSION, "saved_at": int(now),
+                          "items": items}, ensure_ascii=False, sort_keys=True)
+    if payload == _tasks_progress_last_payload:
+        return True
+    path = task_progress_path()
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        os.replace(tmp, path)
+        _tasks_progress_last_payload = payload
+        return True
+    except Exception:
+        return False
 
 def growth_snapshot(account):
     """成长任务 + 汇总；TTL 内直接复用上一份快照，过期或没缓存才请求上游。
@@ -22516,7 +22596,8 @@ class Handler(BaseHTTPRequestHandler):
         if not acc:
             acc = cn_accounts[0]
         tasks, summary = growth_snapshot(acc)
-        record_task_progress(acc.uid, tasks)
+        if record_task_progress(acc.uid, tasks):
+            save_task_progress()
         acct_list = []
         for a in cn_accounts:
             entry = task_progress_entry(a.uid)
@@ -22589,6 +22670,7 @@ class Handler(BaseHTTPRequestHandler):
                     items.append({"uid": account.uid, "done": done,
                                   "total": total, "updated_at": int(now),
                                   "state": "fetched"})
+            save_task_progress()
         return self._json_panel(200, {"items": items})
 
     def _get_scheduler(self):

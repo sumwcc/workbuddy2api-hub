@@ -83,8 +83,6 @@ class CountingTests(unittest.TestCase):
                  {"status": "accepted", "current": "x", "target": 1},
                  {"status": "accepted", "current": 2, "target": 0}]
         self.assertEqual(wb_proxy.task_progress_counts(tasks), (0, 3))
-
-    def test_empty_list_is_zero_over_zero(self):
         self.assertEqual(wb_proxy.task_progress_counts([]), (0, 0))
         self.assertEqual(wb_proxy.task_progress_counts(None), (0, 0))
 
@@ -114,6 +112,38 @@ class CacheTests(unittest.TestCase):
         wb_proxy.record_task_progress("uid-b", [task("claimed")])
         wb_proxy.invalidate_tasks_cache()
         self.assertIsNone(wb_proxy.task_progress_entry("uid-b"))
+
+
+class PersistTests(unittest.TestCase):
+    def test_progress_survives_restart_and_ignores_bad_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original_dir = wb_proxy.USAGE_DIR
+            self.addCleanup(setattr, wb_proxy, "USAGE_DIR", original_dir)
+            self.addCleanup(wb_proxy._tasks_progress_cache.clear)
+            self.addCleanup(setattr, wb_proxy, "_tasks_progress_loaded", True)
+            self.addCleanup(setattr, wb_proxy, "_tasks_progress_last_payload", None)
+            wb_proxy.USAGE_DIR = directory
+            wb_proxy._tasks_progress_cache.clear()
+            wb_proxy._tasks_progress_loaded = False
+            wb_proxy._tasks_progress_last_payload = None
+
+            wb_proxy.record_task_progress("uid-p", [task("claimed"), task("accepted")])
+            self.assertTrue(wb_proxy.save_task_progress())
+            path = os.path.join(directory, "task-progress.json")
+            self.assertTrue(os.path.exists(path))
+
+            # 模拟一次蓝绿发布：内存清空，进度从文件恢复，不再问上游。
+            wb_proxy._tasks_progress_cache.clear()
+            wb_proxy._tasks_progress_loaded = False
+            entry = wb_proxy.task_progress_entry("uid-p")
+            self.assertEqual((entry["done"], entry["total"]), (1, 2))
+
+            # 坏文件一律当作没有缓存，不能让面板挂掉。
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{not json")
+            wb_proxy._tasks_progress_cache.clear()
+            wb_proxy._tasks_progress_loaded = False
+            self.assertIsNone(wb_proxy.task_progress_entry("uid-p"))
 
 
 class EndpointTests(unittest.TestCase):
