@@ -7390,31 +7390,62 @@ def credits_remain_of(account):
 def checkin_today_of(account):
     """今天有没有完成 Buddy 加油站签到（那 100 积分）。
 
-    优先读额度刷新时写进 `credits.checkin` 的快照；老数据没有这个子结构时退回
-    `lastCheckin` 的日期比较。企业号 / 静态 Key 没有个人成长体系，签到不适用，
-    返回 None 让面板显示「—」，不要显示成"未签到"。
+    两个来源，按**时间先后**取结论，不能只认其中一个：
+
+    - `credits.checkin`：额度刷新时顺手问上游 `checkin-activity-status` 的快照，
+      采集时刻记在同一份 `credits` 的 `updated_iso` 上；
+    - `lastCheckin`：本机每次真签成 / 上游答「今天已签到」时写下的确认时刻。
+
+    坑就在这里（2026-11-11 实测）：快照是当天 00:44 采的，那时当然还没签到；
+    09:00 定时器签成、21:12 用户又点一次拿到「今天已签到」写下 lastCheckin。
+    旧实现只要快照里存在 `today_checked_in` 就直接采信，于是徽章一直显示「未签」
+    ——明明上游已经签了。
+
+    规则：谁的时刻更晚信谁。快照不是今天的（或没有时刻）一律当过期，不采信它
+    的「已签」，免得把昨天的 true 当成今天的。企业号 / 静态 Key 没有个人成长
+    体系，返回 None 让面板显示「—」，不要显示成"未签到"。
     """
     try:
         if account.uses_enterprise_billing():
             return {"checkin_today": None, "checkin_credit": 0}
     except Exception:
         pass
+    today = time.strftime("%Y-%m-%d")
     credits = getattr(account, "credits", None)
     snapshot = credits.get("checkin") if isinstance(credits, dict) else None
-    if isinstance(snapshot, dict) and "today_checked_in" in snapshot:
-        credit = snapshot.get("today_credit")
-        try:
-            credit = int(credit)
-        except (TypeError, ValueError):
-            credit = 100
-        return {"checkin_today": bool(snapshot.get("today_checked_in")),
-                "checkin_credit": credit}
-    raw = getattr(account, "last_checkin", None)
-    if raw:
-        today = time.strftime("%Y-%m-%d")
-        return {"checkin_today": str(raw).startswith(today),
-                "checkin_credit": 100}
-    return {"checkin_today": None, "checkin_credit": 100}
+    snapshot_at = ""
+    if isinstance(credits, dict):
+        snapshot_at = str(credits.get("updated_iso") or "")
+        if not snapshot_at:
+            try:
+                snapshot_at = time.strftime("%Y-%m-%d %H:%M:%S",
+                                            time.localtime(float(credits.get("updated_at"))))
+            except (TypeError, ValueError):
+                snapshot_at = ""
+    local_at = str(getattr(account, "last_checkin", "") or "")
+
+    # 没有时刻的老快照按"当场采的"处理（历史数据），否则那些账号会整片掉成「—」
+    snapshot_today = ((snapshot_at.startswith(today) or not snapshot_at)
+                      and isinstance(snapshot, dict)
+                      and "today_checked_in" in snapshot)
+    local_today = local_at.startswith(today)
+
+    if not snapshot_today and not local_today:
+        return {"checkin_today": None, "checkin_credit": 100}
+
+    checked = None
+    if snapshot_today:
+        checked = bool(snapshot.get("today_checked_in"))
+    # 本机记录更晚（当天签到发生在快照采集之后）→ 以本机为准
+    if local_today and (checked is None or local_at > snapshot_at):
+        checked = True
+
+    credit = snapshot.get("today_credit") if snapshot_today else None
+    try:
+        credit = int(credit)
+    except (TypeError, ValueError):
+        credit = 100
+    return {"checkin_today": checked, "checkin_credit": credit}
 
 
 # ---- 进度落盘 ----

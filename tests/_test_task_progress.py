@@ -146,6 +146,41 @@ class PersistTests(unittest.TestCase):
             self.assertIsNone(wb_proxy.task_progress_entry("uid-p"))
 
 
+class CheckinBadgeTests(unittest.TestCase):
+    """下拉里的「已签 / 未签」：快照与本机记录谁更晚信谁。
+
+    2026-11-11 线上实测：快照是当天 00:44 采的（那时当然还没签），09:00 定时器
+    签成、21:12 用户又点一次拿到「今天已签到」。旧实现只要快照里有
+    `today_checked_in` 就无条件采信，于是徽章一直挂「未签」，点一下又回
+    「今天已签到，无需重复」——两边打架。
+    """
+
+    def _today(self, hms):
+        return time.strftime("%Y-%m-%d") + " " + hms
+
+    def test_early_snapshot_loses_to_a_later_local_checkin(self):
+        acct = account("uid-stale",
+                       credits={"checkin": {"today_checked_in": False, "today_credit": 100},
+                                "updated_iso": self._today("00:44:25")},
+                       lastCheckin=self._today("21:12:55"))
+        self.assertIs(wb_proxy.checkin_today_of(acct)["checkin_today"], True)
+
+    def test_yesterdays_snapshot_is_not_trusted(self):
+        yesterday = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+        acct = account("uid-old",
+                       credits={"checkin": {"today_checked_in": True, "today_credit": 100},
+                                "updated_iso": yesterday + " 22:00:00"})
+        # 昨天的「已签」不能当成今天：没有别的证据就报未知（面板显示「—」）
+        self.assertIsNone(wb_proxy.checkin_today_of(acct)["checkin_today"])
+
+    def test_newer_snapshot_overrides_an_earlier_local_record(self):
+        acct = account("uid-refresh",
+                       credits={"checkin": {"today_checked_in": False, "today_credit": 0},
+                                "updated_iso": self._today("22:30:00")},
+                       lastCheckin=self._today("09:00:31"))
+        self.assertIs(wb_proxy.checkin_today_of(acct)["checkin_today"], False)
+
+
 class EndpointTests(unittest.TestCase):
     def setUp(self):
         wb_proxy._tasks_progress_cache.clear()
