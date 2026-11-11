@@ -310,11 +310,12 @@ table.activity-table td[data-label="结果"]{white-space:nowrap}
 .acct-trigger:hover{border-color:var(--line-hover)}
 .acct-trigger-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 .acct-caret{color:var(--dim);font-size:10px;flex:none}
-/* fixed 而不是 absolute：账号区在窗口限高时会有 overflow-y:auto，绝对定位的
-   面板一旦向下展开就被裁掉（看起来"显示不全"）；fixed 只认视口坐标，坐标在
-   placeGrowthMenu() 里按触发器的位置现算，空间不够时向上翻。 */
-.acct-menu{display:none;position:fixed;z-index:120;overflow:auto;background:var(--panel);
-  border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow-md)}
+/* fixed 而不是 absolute：坐标只认视口，由 placeGrowthMenu() 现算，四边都夹在
+   视口内。打开时还会被挂到 document.body 上（见 mountGrowthMenu），否则会被内容区
+   / 左侧 sticky 导航的层叠上下文压住 —— 那正是「账号列被遮挡」的根因。
+   z-index 取到顶层，任何 sticky 栏、卡片、弹层都盖不住它。 */
+.acct-menu{display:none;position:fixed;z-index:9999;overflow:auto;overscroll-behavior:contain;
+  background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow-md)}
 .acct-menu.open{display:block}
 .acct-menu-head,.acct-row{display:grid;grid-template-columns:minmax(140px,1.5fr) 92px 74px 82px;gap:8px;
   align-items:center;padding:6px 10px;font-size:12px}
@@ -9503,29 +9504,71 @@ function updateGrowthOption(uid){
   if(CURRENT_GROWTH_UID === uid) updateGrowthTriggerLabel();
 }
 
-/* 面板坐标现算：宽度按视口收，向下空间不足时向上翻，避免被"窗口限高"的
-   滚动容器裁掉。 */
+/* 面板本身是 position:fixed（坐标按视口算），但只要它还留在内容区里，z-index
+   就只在内容区自己的层叠上下文里生效：左侧导航是 position:sticky + z-index:40
+   的独立层叠上下文，会直接盖住面板左半边的「账号」列。打开时把它挂到 body 上，
+   彻底脱离内容区，z-index 才算全局有效。 */
+function mountGrowthMenu(){
+  const menu = document.getElementById('growthAcctMenu');
+  if(!menu) return null;
+  if(menu.parentElement !== document.body) document.body.appendChild(menu);
+  return menu;
+}
+
+/* 内容区左边界：面板永远不许压到左侧导航底下（那是最常见的「账号列被遮挡」）。 */
+function growthMenuMinLeft(){
+  const side = document.getElementById('nextSidebar');
+  if(side && side.offsetParent !== null){
+    const r = side.getBoundingClientRect();
+    if(r.width > 0 && r.right > 0) return r.right + 8;
+  }
+  return 12;
+}
+
+/* 面板坐标现算：四边都夹在视口内（且不越过左侧导航），纵向只挑空间更大的一侧，
+   高度取该侧真实可用值，超出的部分在面板内部滚动，保证「完整展示」不被裁。 */
 function placeGrowthMenu(){
   const menu = document.getElementById('growthAcctMenu');
   const trigger = document.getElementById('growthAcctTrigger');
   if(!menu || !trigger) return;
   const rect = trigger.getBoundingClientRect();
-  const width = Math.min(560, Math.max(320, window.innerWidth - 24));
-  const below = window.innerHeight - rect.bottom - 12;
-  const above = rect.top - 12;
-  const openUp = below < 220 && above > below;
-  const maxHeight = Math.max(160, Math.min(380, openUp ? above : below));
-  menu.style.width = width + 'px';
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const margin = 12, gap = 6;
+  const minLeft = Math.max(margin, growthMenuMinLeft());
+  const maxRight = vw - margin;
+  // 宽度：四列排开优先 560，可用宽度不够就压缩，不出现横向滚出屏幕
+  const width = Math.min(560, Math.max(240, maxRight - minLeft));
+  // 横向：默认右对齐触发器，再夹进 [minLeft, maxRight - width]
+  const left = Math.max(minLeft, Math.min(rect.right - width, maxRight - width));
+  // 纵向：只挑空间更大的一侧；maxHeight 取该侧真实可用值（不再强撑 160px 顶穿视口）
+  const below = vh - rect.bottom - gap - margin;
+  const above = rect.top - gap - margin;
+  const openUp = below < 240 && above > below;
+  const maxHeight = Math.max(120, Math.floor(openUp ? above : below));
+  menu.style.width = Math.round(width) + 'px';
   menu.style.maxHeight = maxHeight + 'px';
-  const left = Math.max(12, Math.min(rect.right - width, window.innerWidth - width - 12));
-  menu.style.left = left + 'px';
+  menu.style.left = Math.round(left) + 'px';
   if(openUp){
     menu.style.top = 'auto';
-    menu.style.bottom = (window.innerHeight - rect.top + 6) + 'px';
+    menu.style.bottom = Math.round(vh - rect.top + gap) + 'px';
   } else {
     menu.style.bottom = 'auto';
-    menu.style.top = (rect.bottom + 6) + 'px';
+    menu.style.top = Math.round(rect.bottom + gap) + 'px';
   }
+}
+
+/* 面板高度受限、列表又长时，把当前选中行滚进可视区（表头是 sticky 的，要扣掉它）。 */
+function scrollGrowthMenuToActive(){
+  const menu = document.getElementById('growthAcctMenu');
+  if(!menu) return;
+  const active = menu.querySelector('.acct-row.active');
+  if(!active) return;
+  const head = menu.querySelector('.acct-menu-head');
+  const headH = (head && getComputedStyle(head).display !== 'none') ? head.offsetHeight : 0;
+  const mr = menu.getBoundingClientRect();
+  const ar = active.getBoundingClientRect();
+  if(ar.top < mr.top + headH) menu.scrollTop -= (mr.top + headH - ar.top) + 4;
+  else if(ar.bottom > mr.bottom) menu.scrollTop += (ar.bottom - mr.bottom) + 4;
 }
 
 function toggleGrowthAcctMenu(evt){
@@ -9534,8 +9577,14 @@ function toggleGrowthAcctMenu(evt){
   const trigger = document.getElementById('growthAcctTrigger');
   if(!menu) return;
   const open = !menu.classList.contains('open');
-  if(open) placeGrowthMenu();
-  menu.classList.toggle('open', open);
+  if(open){
+    mountGrowthMenu();
+    menu.classList.add('open');
+    placeGrowthMenu();          // 先显示再量，offsetHeight 才是真实值
+    scrollGrowthMenuToActive();
+  } else {
+    menu.classList.remove('open');
+  }
   if(trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
 }
 
@@ -9554,6 +9603,8 @@ function pickGrowthAccount(uid){
 
 document.addEventListener('click', function(evt){
   const picker = document.getElementById('growthAcctPicker');
+  const menu = document.getElementById('growthAcctMenu');
+  if(menu && menu.contains(evt.target)) return;   // 点击面板内部（表头/空白）不关闭
   if(picker && !picker.contains(evt.target)) closeGrowthAcctMenu();
 });
 document.addEventListener('keydown', function(evt){
@@ -9563,9 +9614,13 @@ window.addEventListener('resize', function(){
   const menu = document.getElementById('growthAcctMenu');
   if(menu && menu.classList.contains('open')) placeGrowthMenu();
 });
-window.addEventListener('scroll', function(){
+window.addEventListener('scroll', function(evt){
   const menu = document.getElementById('growthAcctMenu');
-  if(menu && menu.classList.contains('open')) placeGrowthMenu();
+  if(!menu || !menu.classList.contains('open')) return;
+  // 面板内部滚动（长列表）不重算坐标，否则会把用户正滚的列表拉回去
+  const t = evt.target;
+  if(t && t !== document && t !== window && t.nodeType === 1 && menu.contains(t)) return;
+  placeGrowthMenu();
 }, true);
 
 /* 只补没有进度的账号：每批 6 个，批间让 120ms，服务端 3 并发问上游。
