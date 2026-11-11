@@ -9499,16 +9499,21 @@ function placeGrowthMenu(){
   if(!menu || !trigger) return;
   const rect = trigger.getBoundingClientRect();
   const width = Math.min(560, Math.max(320, window.innerWidth - 24));
-  /* 固定朝上展开：位置只由触发器决定，不随剩余空间在上下之间跳来跳去
-     （滚动一点点就换边是上一版的体验问题）。上方空间不够时菜单自己滚动，
-     也不翻到下面去。 */
-  const spaceAbove = rect.top - 12;
+  const below = window.innerHeight - rect.bottom - 12;
+  const above = rect.top - 12;
+  const openUp = below < 220 && above > below;
+  const maxHeight = Math.max(160, Math.min(380, openUp ? above : below));
   menu.style.width = width + 'px';
-  menu.style.maxHeight = Math.max(120, Math.min(420, spaceAbove)) + 'px';
-  menu.style.top = 'auto';
-  menu.style.bottom = (window.innerHeight - rect.top + 6) + 'px';
+  menu.style.maxHeight = maxHeight + 'px';
   const left = Math.max(12, Math.min(rect.right - width, window.innerWidth - width - 12));
   menu.style.left = left + 'px';
+  if(openUp){
+    menu.style.top = 'auto';
+    menu.style.bottom = (window.innerHeight - rect.top + 6) + 'px';
+  } else {
+    menu.style.bottom = 'auto';
+    menu.style.top = (rect.bottom + 6) + 'px';
+  }
 }
 
 function toggleGrowthAcctMenu(evt){
