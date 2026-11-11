@@ -152,7 +152,9 @@ class EndpointTests(unittest.TestCase):
         self.addCleanup(wb_proxy._tasks_progress_cache.clear)
 
     def test_tasks_lists_credits_and_cached_progress(self):
-        acct = account("uid-c", credits={"remain": 1234.5, "size": 2000})
+        acct = account("uid-c", credits={"remain": 1234.5, "size": 2000,
+                                        "checkin": {"today_checked_in": True,
+                                                    "today_credit": 100}})
         wb_proxy.record_task_progress("uid-c", [task("claimed"), task("accepted")])
         handler = Handler()
         with mock.patch.object(wb_proxy, "POOL", FakePool([acct])), \
@@ -165,6 +167,8 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(row["uid"], "uid-c")
         self.assertEqual(row["credits_remain"], 1234.5)
         self.assertEqual((row["tasks_done"], row["tasks_total"]), (1, 2))
+        self.assertIs(row["checkin_today"], True)
+        self.assertEqual(row["checkin_credit"], 100)
 
     def test_progress_dedups_caps_and_skips_unknown(self):
         accounts = [account("uid-%d" % i) for i in range(8)]
@@ -220,10 +224,14 @@ class DashboardTests(unittest.TestCase):
         with open(path, encoding="utf-8") as fh:
             source = fh.read()
         self.assertIn("/tasks/progress?uids=", source)
-        self.assertIn("'剩余 ' + fmt(Number(credit)) + ' 积分'", source)
-        self.assertIn("'任务 ' + (prog && prog.total ? (prog.done + '/' + prog.total) : '—')",
-                      source)
+        # 自绘面板：四列（账号 / 剩余积分 / 任务 / 今日签到），长昵称用省略号截断，
+        # 不再依赖原生 <select> 的弹层宽度。
+        self.assertIn('class="acct-menu"', source)
+        self.assertIn("growthCheckinBadge", source)
+        self.assertIn("growthProgressText", source)
         self.assertIn("renderGrowthAccounts(accts)", source)
+        self.assertIn(">已签<", source)
+        self.assertIn(">未签<", source)
 
 
 if __name__ == "__main__":

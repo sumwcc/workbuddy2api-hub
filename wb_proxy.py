@@ -7387,6 +7387,36 @@ def credits_remain_of(account):
         return None
 
 
+def checkin_today_of(account):
+    """今天有没有完成 Buddy 加油站签到（那 100 积分）。
+
+    优先读额度刷新时写进 `credits.checkin` 的快照；老数据没有这个子结构时退回
+    `lastCheckin` 的日期比较。企业号 / 静态 Key 没有个人成长体系，签到不适用，
+    返回 None 让面板显示「—」，不要显示成"未签到"。
+    """
+    try:
+        if account.uses_enterprise_billing():
+            return {"checkin_today": None, "checkin_credit": 0}
+    except Exception:
+        pass
+    credits = getattr(account, "credits", None)
+    snapshot = credits.get("checkin") if isinstance(credits, dict) else None
+    if isinstance(snapshot, dict) and "today_checked_in" in snapshot:
+        credit = snapshot.get("today_credit")
+        try:
+            credit = int(credit)
+        except (TypeError, ValueError):
+            credit = 100
+        return {"checkin_today": bool(snapshot.get("today_checked_in")),
+                "checkin_credit": credit}
+    raw = getattr(account, "last_checkin", None)
+    if raw:
+        today = time.strftime("%Y-%m-%d")
+        return {"checkin_today": str(raw).startswith(today),
+                "checkin_credit": 100}
+    return {"checkin_today": None, "checkin_credit": 100}
+
+
 # ---- 进度落盘 ----
 # 只放内存的话，蓝绿发布会把一百多个账号的进度清零，下一次开面板又要逐个问
 # 上游。这里存成 `usage/task-progress.json`（发布用的 rsync 已排除 usage/），
@@ -22635,6 +22665,7 @@ class Handler(BaseHTTPRequestHandler):
         acct_list = []
         for a in cn_accounts:
             entry = task_progress_entry(a.uid)
+            checkin = checkin_today_of(a)
             acct_list.append({
                 "uid": a.uid,
                 "nickname": a.nickname or a.uid[:8],
@@ -22642,6 +22673,8 @@ class Handler(BaseHTTPRequestHandler):
                 "tasks_done": entry["done"] if entry else None,
                 "tasks_total": entry["total"] if entry else None,
                 "progress_at": int(entry["at"]) if entry else None,
+                "checkin_today": checkin["checkin_today"],
+                "checkin_credit": checkin["checkin_credit"],
             })
         return self._json_panel(200, {
             "tasks": tasks,
