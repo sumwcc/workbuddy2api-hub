@@ -323,7 +323,17 @@ table.activity-table td[data-label="结果"]{white-space:nowrap}
 .acct-menu-head span:not(:first-child){text-align:right}
 .acct-row{cursor:pointer;border-bottom:1px solid var(--line)}
 .acct-row:last-child{border-bottom:none}
-.acct-row:hover,.acct-row.active{background:var(--panel2)}
+.acct-row:hover{background:var(--panel2)}
+/* 当前选中的账号：底色 + 左侧强调色竖条，滚动到哪儿都能一眼认出来。 */
+.acct-row.active{
+  background:var(--panel2);
+  background:color-mix(in srgb, var(--accent) 18%, var(--panel));
+  box-shadow:inset 3px 0 0 var(--accent);
+  font-weight:600;
+}
+.acct-row.active:hover{
+  background:color-mix(in srgb, var(--accent) 26%, var(--panel));
+}
 .acct-row .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 .acct-row .num{text-align:right;font-variant-numeric:tabular-nums}
 @media (max-width:640px){
@@ -9449,12 +9459,12 @@ function growthAllRow(accts){
 }
 
 function growthCurrentLabel(){
+  /* 触发器只放「号码 (uid6)」：积分 / 任务 / 签到只在下拉列表里看。
+     带上这些信息会把控件撑宽，一选具体账号就把整行工具挤坏。 */
   if(CURRENT_GROWTH_UID === 'all') return '全部国内账号 (批量)';
   const account = GROWTH_ACCOUNTS.get(CURRENT_GROWTH_UID);
   if(!account) return '选择账号';
-  const credit = growthCreditOf(account);
-  return String(account.nickname || account.uid) + ' (' + String(account.uid).slice(0, 6) + ') · '
-    + (credit === null ? '—' : fmt(credit)) + ' 积分 · 任务 ' + growthProgressText(account.uid);
+  return String(account.nickname || account.uid) + ' (' + String(account.uid).slice(0, 6) + ')';
 }
 
 function updateGrowthTriggerLabel(){
