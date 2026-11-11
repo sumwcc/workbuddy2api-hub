@@ -21223,6 +21223,9 @@ BODYLESS_PANEL_POSTS = ("/console/toggle", "/shutdown", "/updates/check",
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # HEAD 只回响应头：do_HEAD 打开这个开关，_json() 据此跳过 body 写入。
+    # 只用于探路路径（/v1/models、/health），其余方法维持原状。
+    _head_only = False
     # 关掉 Nagle（对连接设 TCP_NODELAY）：响应头和响应体是两次独立 write，Nagle
     # 会把第二次小写攒在手里等第一次的 ACK，碰上客户端 delayed ACK 就是每个小响应
     # 白付 ~40ms（路由器实测同一 keep-alive 连接的连续小响应：中位数 50.0ms ->
@@ -21348,7 +21351,9 @@ class Handler(BaseHTTPRequestHandler):
         if cors_origin_allowed(getattr(self, "path", "") or ""):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self.wfile.write(body)
+        # HEAD 只回头：Content-Length 仍然给真实长度，但不写 body（RFC 9110 §9.3.2）。
+        if not getattr(self, "_head_only", False):
+            self.wfile.write(body)
         # Flush here rather than relying on the caller: with HTTP/1.1
         # keep-alive the client blocks until the response is actually on the
         # wire, and an error reply only flushed at the end of the handler looks
@@ -22007,6 +22012,35 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Content-Length", "0")
         self.end_headers()
+    # new-api 在「冷态/疑病态」渠道上发真实请求前，会先 `HEAD <base_url>/v1/models`
+    # 探路：它只看有没有拿到 HTTP 响应（200~599 都算链路活着），用来识别被对端
+    # 静默掐死的 keep-alive 假死连接。以前这里落到 501，功能上没影响，但每分钟一条
+    # 501 既像故障、又污染状态码统计。
+    #   - /v1/models：探路只测 TCP/TLS，不看权限，这里直接 200（不带 body）；
+    #   - /health：复用 GET 的真实结果，只是不写 body；
+    #   - 其它路径：维持原来的 501，行为不变。
+    def do_HEAD(self):
+        path = urlparse(self.path).path
+        if path in ("/v1/models", "/v1/models/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", "0")
+            if cors_origin_allowed(self.path):
+                self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            try:
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
+            return
+        if path == "/health":
+            self._head_only = True
+            try:
+                return self.do_GET()
+            finally:
+                self._head_only = False
+        self.send_error(501, "Unsupported method (%r)" % self.command)
+
     def do_GET(self):
         if not self._apply_pinned_route():
             return
