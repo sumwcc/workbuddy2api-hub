@@ -95,7 +95,23 @@ import wb_modelsdev
 import wb_probes
 import wb_updates
 import wb_update_request
+import wb_time
 IS_WINDOWS = os.name == "nt"
+
+
+def configure_timezone(enabled=None):
+    """Apply the statistics-timezone switch to every formatted time.
+
+    `enabled` defaults to the persisted setting, so this doubles as the startup
+    call and as the panel's post-save hook. Flipping the switch re-bases day and
+    hour buckets, so the day-key memo keyed off the host tz name (which never
+    changes here, since wb_time does not call tzset) is dropped explicitly.
+    """
+    if enabled is None:
+        enabled = wb_settings.stats_tz_beijing(ACCOUNTS_DIR)
+    wb_time.set_enabled(enabled)
+    _row_day_memo_clear()
+    return wb_time.enabled()
 
 # ---- 一键配置客户端（wb_agents）的可用性判定（issue #246）----
 # 这个功能写的是「网关进程所在机器」的客户端配置，所以只有在浏览器和网关
@@ -417,7 +433,7 @@ _MEDIA_KEY_SPEND_LOCK = threading.Lock()
 
 
 def _media_day_key(key_id):
-    return (key_id or "", time.strftime("%Y-%m-%d"))
+    return (key_id or "", wb_time.day_key(time.time()))
 
 
 def media_key_spend(key_id):
@@ -1174,6 +1190,19 @@ def _apply_model_aliases(payload, aliases):
     log("alias: model %s -> %s" % (name, target))
 
 
+def client_facing_model(handler, model):
+    """The model name to echo back: the operator alias when one was used.
+
+    The alias table only rewrites the *request*; the reply otherwise names the
+    upstream id, and a client that verifies the echoed model against the one it
+    sent sees a mismatch. Falling back to `model` keeps every un-aliased request
+    byte-identical. Module-level so the streaming helpers and the tests that
+    drive them with a stub handler can call it too.
+    """
+    original = str(getattr(handler, "_client_model", "") or "").strip()
+    return original or model
+
+
 # The WorkBuddy AI desktop app caches its account product config here on every
 # launch. That file carries the real model catalog the app shows in its picker
 # (21 models, incl. deepseek-v4.1-flash / gpt-6-astra) - the CLI-facing
@@ -1532,8 +1561,7 @@ def _local_midnight(ts=None, days_back=0):
     mktime normalises an out-of-range day, so stepping back past the 1st of a
     month still lands on a real local midnight instead of raising.
     """
-    lt = time.localtime(ts if ts is not None else time.time())
-    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday - days_back, 0, 0, 0, 0, 0, -1))
+    return wb_time.midnight(ts, days_back)
 
 
 def _local_hour_start(ts):
@@ -1544,8 +1572,7 @@ def _local_hour_start(ts):
     相邻的真实时刻，所以调用方还要比对返回值是否等于原值——只有能原样
     还原的 ts 才是真的落在整点上（见 _hour_window_key）。
     """
-    lt = time.localtime(ts)
-    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour, 0, 0, 0, 0, -1))
+    return wb_time.hour_start(ts)
 
 
 def _epoch_or_none(value):
@@ -1590,10 +1617,9 @@ def range_window(value, since=None, until=None):
     if v in ("today", "day", "1d"):
         return _local_midnight(), None
     if v in ("week", "w"):
-        return _local_midnight(days_back=time.localtime().tm_wday), None
+        return _local_midnight(days_back=wb_time.localtime().tm_wday), None
     if v in ("month", "m"):
-        lt = time.localtime()
-        return time.mktime((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 0, -1)), None
+        return wb_time.month_start(), None
     if v == "custom":
         lo, hi = _epoch_or_none(since), _epoch_or_none(until)
         if lo is not None and hi is not None and hi < lo:
@@ -1683,7 +1709,7 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
     usage_missing = not fields
     row = {
         "at": time.time(),
-        "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "iso": wb_time.strftime("%Y-%m-%dT%H:%M:%S"),
         "model": model,
         "stream": bool(stream),
         "outcome": outcome,
@@ -1771,6 +1797,12 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
 
 def record_upstream_usage(upstream, requested_model, usage, **kwargs):
     """Record the model actually billed upstream, preserving the client alias."""
+    finalize = getattr(upstream, "finish_credit_sample", None)
+    if callable(finalize):
+        # CodeArts reports token usage but not a per-request credit value.
+        # Settle the cumulative-credit delta here, at the single accounting
+        # point shared by chat/responses/messages and streaming/non-streaming.
+        usage = finalize(usage)
     billed_model = getattr(upstream, "_wb_billed_model", requested_model)
     # 出口归因（#743）：每条完成行都带上响应对象的账号槽位与实际出口。
     account = POOL.get(getattr(upstream, "_wb_account_uid", "")) if POOL else None
@@ -1850,7 +1882,7 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
     fields = _extract_usage(usage) or {}
     row = {
         "at": time.time(),
-        "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "iso": wb_time.strftime("%Y-%m-%dT%H:%M:%S"),
         "model": model,
         "error": True,
         "outcome": outcome,
@@ -2728,6 +2760,7 @@ _STATS_TTL = float(os.environ.get("WB_STATS_TTL", 15))
 # reads rows that arrived since the last scan.
 # ---------------------------------------------------------------------------
 _daily_usage = {"day": "", "totals": None, "credits": None, "models": None,
+                "keytokens": None,
                 "offset": 0, "at": 0.0,
                 # See _scan_daily_usage's caller: (size, dev, inode) of the log
                 # the cached offset was taken against, plus the 64 bytes just
@@ -2748,6 +2781,9 @@ def _daily_state_copy(source):
         "tokens": dict(source.get("totals") or {}),
         "credits": dict(source.get("credits") or {}),
         "models": {k: dict(v) for k, v in (source.get("models") or {}).items()},
+        # key 维度的同日用量（API Key 日限量用）。与 uid 视图是同一批行的
+        # 两种折叠方式，多这一项不增加任何 I/O。
+        "keytokens": dict(source.get("keytokens") or {}),
     }
 
 
@@ -2782,10 +2818,15 @@ def _scan_daily_usage(offset, state):
             # consumed request, and its token counts are incomplete.
             if row_outcome(row) == "client_aborted":
                 continue
+            tokens = row.get("total_tokens") or 0
+            # key 维度累加必须先于 uid 判空：400 失败行没有 account 字段
+            # （全库仅 24.3% 的失败行带账号），但它一定有 key。
+            kid = row.get("key")
+            if kid:
+                state["keytokens"][kid] = state["keytokens"].get(kid, 0) + tokens
             uid = row.get("account")
             if not uid:
                 continue
-            tokens = row.get("total_tokens") or 0
             state["tokens"][uid] = state["tokens"].get(uid, 0) + tokens
             credit = row.get("credit") or 0
             if credit:
@@ -2806,7 +2847,7 @@ def daily_usage_stats(ttl=None):
     an account.
     """
     ttl = _STATS_TTL if ttl is None else ttl
-    day = time.strftime("%Y-%m-%d")
+    day = wb_time.day_key(time.time())
     now = time.time()
     with _daily_usage_lock:
         c = _daily_usage
@@ -2817,7 +2858,7 @@ def daily_usage_stats(ttl=None):
         if c["day"] == day and c["totals"] is not None:
             state = _daily_state_copy(c)
         else:
-            state = {"tokens": {}, "credits": {}, "models": {}}
+            state = {"tokens": {}, "credits": {}, "models": {}, "keytokens": {}}
         offset = int(c["offset"] or 0)
         log_key = _usage_log_key(USAGE_LOG)
         # Resume the cached fold only when the bytes it counted are provably
@@ -2836,7 +2877,7 @@ def daily_usage_stats(ttl=None):
                            and c.get("tail") is not None
                            and _log_offset_holds(c["key"], log_key, offset)
                            and _log_tail_signature(offset, USAGE_LOG) == c["tail"]):
-            state = {"tokens": {}, "credits": {}, "models": {}}
+            state = {"tokens": {}, "credits": {}, "models": {}, "keytokens": {}}
             offset = 0
         try:
             state, offset = _scan_daily_usage(offset, state)
@@ -2849,7 +2890,9 @@ def daily_usage_stats(ttl=None):
         # call can prove this prefix still holds the same bytes.
         _daily_usage.update({"day": day, "totals": state["tokens"],
                              "credits": state["credits"],
-                             "models": state["models"], "offset": offset,
+                             "models": state["models"],
+                             "keytokens": state["keytokens"],
+                             "offset": offset,
                              "key": _usage_log_key(USAGE_LOG),
                              "tail": _log_tail_signature(offset, USAGE_LOG),
                              "at": time.time()})
@@ -2870,8 +2913,7 @@ def daily_tokens_by_account(ttl=None):
 
 def seconds_until_local_midnight():
     """Seconds until the local day rolls over (at least a minute)."""
-    lt = time.localtime()
-    nxt = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1, 0, 0, 0, 0, 0, -1))
+    nxt = wb_time.midnight(days_back=-1)
     return max(60, int(nxt - time.time()))
 
 
@@ -3380,9 +3422,7 @@ def _remaining_activity_floor(now):
     不是 now − 24h，因为需求写的是「昨日或当日」；同一天里这个下界不变，
     面板因此不会在轮询之间来回抖动。
     """
-    lt = time.localtime(now)
-    midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
-    return midnight - LIMIT_WINDOW_SECONDS
+    return wb_time.midnight(now) - LIMIT_WINDOW_SECONDS
 
 
 def _save_account_caps(account, model, reset_at):
@@ -3809,9 +3849,9 @@ def _remaining_sample_rows(events, realm, model):
         rows.append({
             "account": str(event.get("account") or ""),
             "at": at,
-            "at_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(at)) if at else "",
+            "at_iso": wb_time.iso_seconds(at) if at else "",
             "reset": reset,
-            "reset_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reset)) if reset else "",
+            "reset_iso": wb_time.iso_seconds(reset) if reset else "",
             "sample": int(event.get("sample") or 0),
         })
     rows.sort(key=lambda row: (row["at"], row["account"]))
@@ -3876,8 +3916,7 @@ def _remaining_payload_locked(state, now, accounts, realm_of, daily):
         key = int(ts)
         out = iso_cache.get(key)
         if out is None:
-            out = iso_cache[key] = time.strftime("%Y-%m-%d %H:%M:%S",
-                                                 time.localtime(ts))
+            out = iso_cache[key] = wb_time.iso_seconds(ts)
         return out
 
     # 撞线锚点：事件日志 + 凭证档里的 model_caps，按 (账号, 模型, 重置时刻)
@@ -4180,11 +4219,11 @@ def credits_is_free(value):
 def free_models_by_realm():
     """realm -> set of model ids the catalogue marks free ("x0.00").
 
-    Built from the bundled snapshot and the desktop cache file - both local
-    reads, no network - and cached for a minute so the request path pays
-    nothing. The daily credit guard uses it to tell paid models from free
-    ones, per realm: the same id can be free on one exit and paid on the
-    other.
+    Built from the bundled snapshot, the desktop cache file, and the live
+    ``_models_cache`` entry when it exists - all local reads, no network - and
+    cached for a minute so the request path pays nothing. The daily credit
+    guard uses it to tell paid models from free ones, per realm: the same id
+    can be free on one exit and paid on the other.
     """
     now = time.time()
     data = _free_models_cache.get("data")
@@ -4205,8 +4244,67 @@ def free_models_by_realm():
             for mid, item in (cached[1] or {}).items():
                 if isinstance(item, dict) and credits_is_free(item.get("credits")):
                     free.add(str(mid))
+        # The live /v3/config result can contain a newly free model that neither
+        # the bundled snapshot nor the desktop cache file knows yet (hy4free).
+        live = (_models_cache.get(realm) or {}).get("data") or []
+        for mid, item in live:
+            if isinstance(item, dict) and credits_is_free(item.get("credits")):
+                free.add(str(mid))
         out[realm] = free
     _free_models_cache.update({"at": now, "data": out})
+    return out
+
+
+def free_model_candidates(realm="intl"):
+    """Ordered free chat models for automatic daily-activity fallback.
+
+    The live catalogue is the source of truth; the desktop cache and bundled
+    snapshot only fill gaps. ``deepseek-v4.1-flash`` is deliberately excluded:
+    the intl alias sends it to the paid ``-sg`` build now, so it is the
+    preferred model rather than a free fallback. The same applies to every
+    ``-sg`` variant and to anything whose catalogue price is not x0.00.
+    """
+    r = realm if realm in ("intl", "cn") else "intl"
+    preferred = wb_accounts.DAILY_CHAT_MODEL
+    excluded = {preferred.lower(), (preferred + "-sg").lower()}
+    sources = []
+    live = (_models_cache.get(r) or {}).get("data") or []
+    if live:
+        sources.append(live)
+    cached = read_cached_remote_catalog(r)
+    if cached:
+        sources.append(list((cached[1] or {}).items()))
+    # The gateway's own last successful /v3/config copy. It is not part of the
+    # /v1/models read path, but it is the freshest local evidence on a headless
+    # install where the desktop app is absent and the 300s cache is cold.
+    try:
+        with open(catalog_cache_path(r), encoding="utf-8") as fh:
+            archived = parse_remote_catalog(json.load(fh))
+        if archived:
+            sources.append(list((archived[1] or {}).items()))
+    except Exception:
+        pass
+    sources.append(getattr(
+        wb_catalog, "STATIC_CN_MODELS" if r == "cn" else "STATIC_INTL_MODELS",
+        getattr(wb_catalog, "STATIC_MODELS", [])))
+    out = []
+    seen = set()
+    for source in sources:
+        for entry in source or []:
+            if isinstance(entry, tuple):
+                mid, item = entry
+            else:
+                mid = (entry or {}).get("id") if isinstance(entry, dict) else None
+                item = entry
+            mid = str(mid or "").strip()
+            if not mid or mid in seen or not is_chat_model(mid):
+                continue
+            if mid.lower() in excluded or mid.lower().endswith("-sg"):
+                continue
+            if not isinstance(item, dict) or not credits_is_free(item.get("credits")):
+                continue
+            seen.add(mid)
+            out.append(mid)
     return out
 
 
@@ -4985,6 +5083,16 @@ def _row_memo_tz_changed():
     return True
 
 
+def _row_day_memo_clear():
+    """无条件清空日键表。
+
+    统计时区开关不经过 tzset（wb_time 用固定偏移），所以 time.tzname 不会变，
+    _row_memo_tz_changed 会早退、表照样留着旧时区的日键。开关一动必须显式
+    清一次，否则「今日用量」在切换后的一整轮里仍按旧日键归并。
+    """
+    _row_day_memo.clear()
+
+
 def _cost_entry(pricing, cost):
     """cost_for_row(details=False) 的返回值 -> 记忆条目（定长元组）。"""
     return (pricing, cost["known"], cost["cny"], cost.get("band"),
@@ -5523,7 +5631,7 @@ def _usage_snapshot_uncached(realm=None, since=None, until=None):
     else:
         snap = _usage_snapshot_window(r, since, until, pricing_on)
     snap["started"] = _usage.get("started", time.time())
-    snap["since"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snap.get("started", time.time())))
+    snap["since"] = wb_time.iso_seconds(snap.get("started", time.time()))
     snap["log_file"] = USAGE_LOG
     snap["realm"] = r or "all"
     # Cost figures are CNY; the panel divides by this rate to show USD
@@ -7062,7 +7170,8 @@ def save_persisted_realm(realm):
         try:
             os.makedirs(ACCOUNTS_DIR, exist_ok=True)
             with open(realm_state_file(), "w", encoding="utf-8") as fh:
-                json.dump({"realm": realm, "updated_at": time.time(), "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S")}, fh, indent=2)
+                json.dump({"realm": realm, "updated_at": time.time(),
+                           "updated_iso": wb_time.iso_seconds(time.time())}, fh, indent=2)
             log("persisted active realm '%s' to disk" % realm)
         except Exception as exc:
             log("failed to persist active realm: %s" % exc)
@@ -7163,7 +7272,7 @@ def _parse_stamp_epoch(text):
     if not text:
         return None
     try:
-        return time.mktime(time.strptime(str(text)[:19], "%Y-%m-%d %H:%M:%S"))
+        return wb_time.mktime(time.strptime(str(text)[:19], "%Y-%m-%d %H:%M:%S"))
     except Exception:
         return None
 
@@ -7278,10 +7387,9 @@ def credit_grants(now=None):
     return {
         "ok": True,
         "generated_at": now,
-        "generated_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+        "generated_iso": wb_time.iso_seconds(now),
         "fetched_at": fetched or None,
-        "fetched_iso": (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(fetched))
-                        if fetched else None),
+        "fetched_iso": (wb_time.iso_seconds(fetched) if fetched else None),
         "rows": rows,
         "summary": {
             "count": len(rows),
@@ -7543,6 +7651,17 @@ def growth_snapshot(account):
     with _tasks_cache_lock:
         _tasks_cache[account.uid] = (time.time() + TASKS_CACHE_TTL, data)
     return data
+
+
+# ---- 进度落盘 ----
+# 只放内存的话，蓝绿发布会把一百多个账号的进度清零，下一次开面板又要逐个问
+# 上游。这里存成 `usage/task-progress.json`（发布用的 rsync 已排除 usage/），
+# 原子写 + 版本号；文件坏了、版本不符、条目过期都当作没有，重新问上游即可。
+TASK_PROGRESS_FILE = "task-progress.json"
+TASK_PROGRESS_VERSION = 1
+_tasks_progress_loaded = False
+_tasks_progress_last_payload = None
+
 
 def _both(tasks_fn, summary_fn, account):
     """并发跑两条上游查询；任一条抛错就照旧往外抛（不写进快照）。"""
@@ -8777,10 +8896,10 @@ def _local_day_key(ts):
     try:
         hit = memo.get(ts)
     except TypeError:
-        return time.strftime("%Y-%m-%d", time.localtime(ts))
+        return wb_time.day_key(ts)
     if hit is not None:
         return hit
-    key = time.strftime("%Y-%m-%d", time.localtime(ts))
+    key = wb_time.day_key(ts)
     cap = _ROW_MEMO_MAX
     if cap > 0:
         if len(memo) >= cap:
@@ -8797,7 +8916,7 @@ def _local_day_key(ts):
 def _day_key_start(key):
     """日键 -> 该日的本地午夜 epoch。"""
     lt = time.strptime(key, "%Y-%m-%d")
-    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    return wb_time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
 
 
 def _window_day_key(since):
@@ -11822,6 +11941,12 @@ def runtime_settings_view():
             "realm": entry.get("realm") or "",
             "models": list(entry.get("models") or []),
             "accounts": list(entry.get("accounts") or []),
+            # daily_token_limit 只存不显会让面板把日限量画成 0，用户以为没设过，
+            # 再保存一次就把真实值写回 0（与 #592 同类的坑）。
+            "daily_token_limit": int(entry.get("daily_token_limit") or 0),
+            # concurrency_limit 上游只存不显：面板读不到就显示 0，用户以为没设过，
+            # 再保存一次又把真实值写回 0。
+            "concurrency_limit": int(entry.get("concurrency_limit") or 0),
             "enabled": entry.get("enabled", True) is not False,
             "masked": (raw[:4] + "*" * 6 + raw[-4:]) if len(raw) > 8 else "*" * len(raw),
             "source": entry.get("source") or "panel",
@@ -11868,6 +11993,8 @@ def runtime_settings_view():
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
         "auto_switch_products": wb_settings.auto_switch_products(ACCOUNTS_DIR),
         "enable_anthropic_messages": wb_settings.enable_anthropic_messages(ACCOUNTS_DIR),
+        "model_aliases": wb_settings.model_aliases(ACCOUNTS_DIR),
+        "model_aliases_enabled": wb_settings.model_aliases_enabled(ACCOUNTS_DIR),
         "filter_models_by_key": wb_settings.filter_models_by_key(ACCOUNTS_DIR),
         "reasoning_effort_map": wb_settings.reasoning_effort_map(ACCOUNTS_DIR),
         "models_only_available": wb_settings.models_only_available(ACCOUNTS_DIR),
@@ -11897,6 +12024,8 @@ def runtime_settings_view():
         # （它们的值仍然被读取，用于把老部署的配置换算成预算与候选序列）。
         "daily_chat_models": wb_settings.daily_chat_models(ACCOUNTS_DIR),
         "daily_chat_models_max": wb_settings.DAILY_CHAT_MODELS_MAX,
+        "daily_chat_prefer_flash":
+            wb_settings.daily_chat_prefer_flash(ACCOUNTS_DIR),
         "daily_chat_budget": wb_settings.daily_chat_budget(
             ACCOUNTS_DIR, default=wb_accounts.WEB_BUDGET_DEFAULT),
         "daily_chat_budget_default": wb_accounts.WEB_BUDGET_DEFAULT,
@@ -11935,6 +12064,7 @@ def runtime_settings_view():
         "media_minimums": dict(wb_settings.MEDIA_MINIMUMS),
         "media_realms": list(wb_settings.MEDIA_REALMS),
         "log_db_enabled": wb_settings.log_db_enabled(ACCOUNTS_DIR),
+        "stats_tz_beijing": wb_settings.stats_tz_beijing(ACCOUNTS_DIR),
         "log_db_max_rows": wb_settings.log_db_max_rows(ACCOUNTS_DIR),
         "log_db_max_days": wb_settings.log_db_max_days(ACCOUNTS_DIR),
         "log_db_max_bytes": wb_settings.log_db_max_bytes(ACCOUNTS_DIR),
@@ -11971,7 +12101,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "2.0.9",
+        "version": "2.1.1",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -12100,8 +12230,7 @@ def affinity_route(messages):
             # 不同的地方，又只占一轮的 token，哈希开销可忽略。system 提示相同
             # 时它同样稳定（同一会话每轮都能算出同一个键）。
             head = msgs[:3]
-        blob = json.dumps(head, ensure_ascii=False, sort_keys=True).encode("utf-8", "backslashreplace")
-        digest = hashlib.sha256(blob).hexdigest()[:16]
+        digest = _affinity_digest(head)
         key = "pfx-" + digest
         if AFFINITY_MAX_MSGS > 0 and len(msgs) > AFFINITY_MAX_MSGS:
             if AFFINITY_PAGE_SIZE > 1:
@@ -12123,6 +12252,115 @@ def affinity_route(messages):
 def derive_affinity_key(messages):
     """Conversation key only; see affinity_route for the pool page."""
     return affinity_route(messages)[0]
+
+
+def _affinity_digest(head):
+    """sha256[:16] of a message head; shared by affinity_route and the prebind.
+
+    `backslashreplace` 兜住 lone surrogate：上游或客户端偶发传入孤立代理项
+    （截断的 emoji 之类），直接 encode("utf-8") 会抛 UnicodeEncodeError，整条
+    请求 502。这里按字节回退转义，同一输入仍得到同一个稳定哈希，亲和性不受影响。
+    """
+    blob = json.dumps(head, ensure_ascii=False, sort_keys=True).encode("utf-8", "backslashreplace")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def affinity_prefix_key(messages, head=2):
+    """'pfx-<digest>' for the first `head` messages, as affinity_route derives it."""
+    if not messages:
+        return None
+    return "pfx-" + _affinity_digest(messages[:head])
+
+
+#: 单发 /v1/messages 落到几个号上。0 = 关闭（回落现状：被首条 user 文本打散到整池）。
+MSGSTAT_SHARDS = int(os.environ.get("WB_MSGSTAT_SHARDS", "0") or 0)
+#: 亲和键每天换一次盐：同一 (key, 模型, system, tools) 组合的 conversation id
+#: 每天重新开一桶，避免上游把几千个不相干的单发调用聚成同一条会话。
+MSGSTAT_DAILY_SALT = os.environ.get(
+    "WB_MSGSTAT_DAILY_SALT", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _msgstat_text(message):
+    content = (message or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text") or part.get("content") or ""))
+            else:
+                parts.append(str(part))
+        return "".join(parts)
+    if content is None:
+        return ""
+    return json.dumps(content, ensure_ascii=False, sort_keys=True)
+
+
+def msgstat_affinity_key(key_id, chat):
+    """Stable affinity key for a one-shot /v1/messages call, or None.
+
+    A single-shot call is [system, user] and is never streamed; the user text
+    differs on every call, so the prefix-derived key (affinity_route) differs
+    too and every call round-robins onto a cold account. The upstream prompt
+    cache is per account, so a cold account re-pays the whole system prefix.
+
+    Hash only the parts that stay stable for one client configuration instead,
+    and bucket the volatile tail over MSGSTAT_SHARDS so a few accounts stay
+    warm. Returns None (prefix affinity) for anything that looks like a real
+    conversation: streamed, or already past the first continuation.
+    """
+    if MSGSTAT_SHARDS <= 0 or not isinstance(chat, dict):
+        return None
+    msgs = chat.get("messages") or []
+    if chat.get("stream") or len(msgs) > 3 or len(msgs) < 2:
+        return None
+    names = []
+    for tool in (chat.get("tools") or []):
+        fn = tool.get("function") if isinstance(tool, dict) else None
+        name = fn.get("name") if isinstance(fn, dict) else None
+        names.append(str(name or ""))
+    stable = _affinity_digest({
+        "k": key_id or "",
+        "m": chat.get("model") or "",
+        "s": _msgstat_text(msgs[0]),
+        "t": sorted(names),
+    })
+    volatile = hashlib.sha256(
+        json.dumps(msgs[1:], ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:8]
+    key = "msgstat-%s-%d" % (stable, int(volatile, 16) % MSGSTAT_SHARDS)
+    if MSGSTAT_DAILY_SALT:
+        key += "-" + time.strftime("%Y-%m-%d")
+    return key
+
+
+def prebind_prefix_second_turn(chat):
+    """Turn 2 hashes msgs[:3] while turn 1 bound msgs[:2]; carry the account over.
+
+    Without this the second turn is always a new affinity key, so it lands on a
+    cold account and re-pays the whole prefix. Only the first continuation is
+    touched: later turns already agree with turn 2.
+    """
+    if POOL is None or not affinity_stable_key_enabled():
+        return
+    msgs = chat.get("messages") if isinstance(chat, dict) else None
+    if not msgs or len(msgs) != 4:
+        return
+    old, new = affinity_prefix_key(msgs, 2), affinity_prefix_key(msgs, 3)
+    if not old or not new or old == new:
+        return
+    try:
+        uid = POOL.affinity.get(old)
+    except Exception:
+        uid = None
+    if uid:
+        try:
+            POOL.affinity.bind(new, uid)
+        except Exception:
+            pass
+
+
 def prompt_fingerprint(messages):
     """Privacy-safe fingerprint of the outgoing prompt.
     Cache hits need a byte-identical prefix, so these hashes answer "is my
@@ -12295,8 +12533,8 @@ def _log_db_active():
 
 def add_log_entry(msg, level=None, tag=None):
     global _LOG_COUNTER
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    t_short = time.strftime("%H:%M:%S")
+    ts = wb_time.strftime("%Y-%m-%d %H:%M:%S")
+    t_short = wb_time.strftime("%H:%M:%S")
     msg_str = str(msg).rstrip()
     if not level:
         lower = msg_str.lower()
@@ -12447,7 +12685,7 @@ def log(msg, level=None, tag=None):
         add_log_entry(msg, level=level, tag=tag)
         return
     _ensure_log_writer()
-    line = f"[wb-proxy] {time.strftime('%H:%M:%S')} {_mask_text(str(msg))}\n"
+    line = f"[wb-proxy] {wb_time.strftime('%H:%M:%S')} {_mask_text(str(msg))}\n"
     try:
         _LOG_QUEUE.put_nowait(line)
     except queue.Full:
@@ -12792,9 +13030,48 @@ def fetch_models(realm=None):
                 file_mtime = None
         with _lock:
             _models_cache[r] = {"at": time.time(), "data": entries}
+            _free_models_cache.update({"at": 0.0, "data": None})
             _catalog_meta[r] = {"source": source, "fetched_at": time.time(),
                                 "file_mtime": file_mtime}
         return entries
+def alias_model_entries(data, aliases):
+    """Append operator aliases to a /v1/models list, pointing at their target.
+
+    The alias table rewrites the request body before dispatch, so a client that
+    sends an alias works. The catalogue has to say the same thing: a client
+    that discovers models from /v1/models would otherwise never see the custom
+    name it was told to use (and the panel's key model restriction is expressed
+    in client-visible names too).
+
+    An alias is only listed when its target is present in this catalogue -
+    advertising an alias whose target is not served here would hand the client
+    a name that fails on the first call. The entry copies the target's metadata
+    and swaps only ``id`` (plus ``name`` when the target had one), because the
+    client must send the alias.
+    """
+    if not aliases or not isinstance(data, list):
+        return data
+    by_id = {}
+    for item in data:
+        if isinstance(item, dict) and item.get("id"):
+            by_id.setdefault(str(item["id"]), item)
+    seen = set(by_id)
+    extra = []
+    for alias, target in aliases.items():
+        if alias in seen or not target:
+            continue
+        source = by_id.get(str(target))
+        if source is None:
+            continue
+        entry = dict(source)
+        entry["id"] = alias
+        if source.get("name"):
+            entry["name"] = alias
+        extra.append(entry)
+        seen.add(alias)
+    return data + extra
+
+
 def model_entry(mid, meta, realm=None):
     """Build a rich /v1/models entry from the desktop app catalog metadata.
     The OpenAI spec only names id/object/created/owned_by, so capability data is
@@ -13244,6 +13521,7 @@ def refresh_catalog(realm):
         note_bundled_reasoning(realm, live, entries)
         with _lock:
             _models_cache[realm] = {"at": time.time(), "data": entries}
+            _free_models_cache.update({"at": 0.0, "data": None})
             _catalog_meta[realm] = {"source": "remote", "fetched_at": time.time(),
                                     "file_mtime": None}
     log("catalog refresh: %s updated from the product-config endpoint (%d models)"
@@ -13728,6 +14006,26 @@ def has_fingerprint(text, identity=True, billing=True):
     return SANITIZE_IDENTITY_RE.search(text) is not None
 
 
+#: 计费头的宽松兜底：严格解析认不出时，按「看起来就是计费头」整段删除。
+#: 默认关闭，保持 #853 之后的严格语义；WB_SANITIZE_LOOSE_BILLING=1 打开。
+SANITIZE_LOOSE_BILLING = os.environ.get(
+    "WB_SANITIZE_LOOSE_BILLING", "0").strip().lower() in ("1", "true", "yes", "on")
+#: 一条计费头至少带两个 `cc_*=` / `cch=` 键值；正常 system 首行不会有。
+BILLING_KV_TOKENS_RE = re.compile(
+    r"(?:^|[;\s])(?:cc_[a-z0-9_]+|cch)=[^\s;]*", re.IGNORECASE)
+
+
+def _looks_like_billing_line(line):
+    """True when `line` reads like a Claude Code billing header, strict or not."""
+    text = str(line or "")
+    if not text or len(text) > 400:
+        return False
+    low = text.lower()
+    if any(name in low for name in SANITIZE_BILLING_LOWER):
+        return True
+    return len(BILLING_KV_TOKENS_RE.findall(text)) >= 2
+
+
 def _billing_payload_is_metadata(value):
     """True when a candidate header value contains only known metadata pairs."""
     value = str(value or "").strip()
@@ -13769,7 +14067,19 @@ def sanitize_billing_metadata_prefix(text):
     first = lines[0].rstrip("\r\n")
     match = SANITIZE_BILLING_LINE_RE.fullmatch(first)
     if match is None or not _billing_payload_is_metadata(match.group(1)):
-        return text
+        # 严格路径认不出（客户端改了字段名、多塞了未知键）：只要首行看起来就是
+        # 计费头，仍然整段丢掉。这类行每请求都不同，留在 system 首部等于每轮把
+        # 整段前缀打掉；宁可误删一行元数据，也不要静默贡献 0% 命中。
+        if not SANITIZE_LOOSE_BILLING or not _looks_like_billing_line(first):
+            return text
+        end = 1
+        while end < len(lines):
+            candidate = lines[end].rstrip("\r\n")
+            if not (SANITIZE_BILLING_CONT_RE.fullmatch(candidate)
+                    or _looks_like_billing_line(candidate)):
+                break
+            end += 1
+        return "".join(lines[end:]).strip()
     end = 1
     while end < len(lines):
         candidate = lines[end].rstrip("\r\n")
@@ -15977,7 +16287,7 @@ class PinnedAccountError(Exception):
 
 
 class ContentRejected(Exception):
-    """Upstream content review rejected this request (403 / code 11140).
+    """Upstream content review rejected this request (HTTP 403).
 
     Not an account problem: another credential gets the same 403 for the same
     content, so it is passed straight through instead of cooling the pool.
@@ -16049,8 +16359,8 @@ def gateway_hint(status, message):
     if ("11140" in lower or "账号存在异常行为" in text
             or "account has been restricted" in lower
             or "unusual activity" in lower):
-        return ("上游已对该账号做账号级风控限制（403 / code 11140）；网关已让该账号"
-                "冷却并停止换号重试。请勿换号或高频重试（同设备账号会连坐），"
+        return ("上游已封禁该账号（403 / code 11140）；网关已停止派发和换号重试。"
+                "请勿换号或高频重试（同设备账号会连坐），"
                 "按 WorkBuddy 官方渠道申诉，通常 1-3 个工作日自动解除。")
     if "no usable account" in lower or "no healthy account" in lower:
         return "no healthy account available in pool; check /status or retry later"
@@ -16697,7 +17007,7 @@ def maybe_dump_11_128(exc, detail, endpoint, model, fp=None, stream=None,
         summary = {
             "schema": 1,
             "at": time.time(),
-            "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "iso": wb_time.strftime("%Y-%m-%dT%H:%M:%S"),
             "endpoint": endpoint,
             "status": status,
             "model": model,
@@ -16733,7 +17043,7 @@ def maybe_dump_11_128(exc, detail, endpoint, model, fp=None, stream=None,
 
         outdir = os.path.join(USAGE_DIR, DUMP_11_128_DIR)
         os.makedirs(outdir, exist_ok=True)
-        stamp = time.strftime("%Y%m%d-%H%M%S")
+        stamp = wb_time.strftime("%Y%m%d-%H%M%S")
         base = "%s-%s-%s" % (stamp, _dump_filename_part(endpoint),
                              _dump_filename_part(request_id or body_key[:12]))
         path = os.path.join(outdir, base + ".json")
@@ -16933,9 +17243,8 @@ def rate_limit_is_account_level(detail, reset_at):
     return credential_scope_phrase(detail) is not None
 
 
-#: 上游风控限制（HTTP 403, code 11140「账号存在异常行为，已被限制使用」）
-#: 的账号冷却时长。定义在 wb_accounts：这是账号级状态且要持久化
-#: （restrictedUntil），时长跟着它走，避免两处各写一份。
+#: 上游账号封禁（HTTP 403, code 11140「账号存在异常行为，已被限制使用」）
+#: 命中即持久禁用，不再有冷却时长或自动恢复。保留常量仅兼容外部导入。
 RESTRICTED_403_COOLDOWN = wb_accounts.RESTRICTED_ACCOUNT_COOLDOWN
 
 # --- 风控连坐保护 ---------------------------------------------------------
@@ -17005,7 +17314,7 @@ def clamp_restriction_holds(max_seconds, now=None):
 
 
 def note_account_restriction(realm, uid="", now=None):
-    """记一次账号级风控限制；若触发连坐暂停则返回暂停到的 epoch（0 = 尚未触发）。
+    """记一次账号级封禁；若触发连坐暂停则返回暂停到的 epoch（0 = 尚未触发）。
 
     同一个区域内达到 RESTRICTION_WAVE_MIN 个**不同**账号被限制，判定为该区域
     遭到了设备 / 出口级别的风控连坐扫荡，全区域紧急暂停配置的 hold_seconds 秒；期间
@@ -17033,16 +17342,16 @@ def note_account_restriction(realm, uid="", now=None):
 
 def restriction_hold_message(realm, remaining):
     """整池暂停期间交给客户端的说明。"""
-    return ("上游风控已限制本区域账号（403 / code 11140，账号存在异常行为）。"
+    return ("上游已封禁本区域账号（403 / code 11140，账号存在异常行为）。"
             "网关已暂停派发 %d 秒，避免继续换号重试导致同设备账号连坐被封。"
             "请勿换号或高频重试；按 WorkBuddy 官方渠道申诉（通常 1-3 个工作日"
-            "自动解除），解封后再恢复。 Upstream restricted the account(s); "
+            "自动解除），解封后再恢复。 Upstream banned the account(s); "
             "dispatch paused %ds to avoid further bans."
             % (int(remaining), int(remaining)))
 
 
 def _persist_restriction(account):
-    """把 restrictedUntil 落盘；失败只记日志，不影响请求路径。"""
+    """把账号封禁状态落盘；失败只记日志，不影响请求路径。"""
     try:
         path = getattr(account, "path", "") or ""
         if path:
@@ -17361,7 +17670,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             raise PinnedAccountError(
                 503, "pinned account '%s' is not usable right now: %s"
                 % (pinned_ref(), pinned.unavailable_reason(model)), pinned.uid)
-    # 连坐保护：同一区域刚有账号被上游风控限制，整池暂停派发。这里直接快速
+    # 连坐保护：同一区域刚有账号被上游封禁，整池暂停派发。这里直接快速
     # 失败、一个上游请求都不发——继续打只会把同一台设备上的其他账号也送走。
     hold = restriction_hold_remaining(realm)
     if hold > 0:
@@ -17766,18 +18075,17 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     detail = read_http_error(exc, 600).decode("utf-8", "replace")
                 except Exception:
                     detail = ""
-                # 先分流：上游风控限制（code 11140「账号存在异常行为，已被限制
+                # 先分流：上游账号封禁（code 11140「账号存在异常行为，已被限制
                 # 使用」）是账号级的坏，降级提示词救不了。处置按社区复盘的红线
                 # 走：冷却这个账号（持久化）、记一次连坐事件，然后**停手**——
                 # 不再把同一条请求换到下一个号上继续打（默认，见
                 # RESTRICTED_403_ROTATE_MAX）。
                 if restriction_is_account_level(detail):
-                    account.note_restricted(detail=detail,
-                                            cooldown=RESTRICTED_403_COOLDOWN)
+                    account.note_restricted(detail=detail)
                     _persist_restriction(account)
-                    log("account %s restricted by upstream (403 11140), "
-                        "cooling %.0fs (persisted)" % (account.uid[:8],
-                                                       RESTRICTED_403_COOLDOWN))
+                    log("account %s banned by upstream (403 11140), "
+                        "disabled until manually re-enabled (persisted)"
+                        % account.uid[:8])
                     if session_key and POOL:
                         POOL.affinity.demote(session_key, account.uid)
                     last_error = exc
@@ -18139,7 +18447,7 @@ def open_upstream_with_fallback(payload, session_key=None, target_realm=None,
       * `no usable account` 的 RuntimeError —— 该出口的账号全部停用/过期/熔断，
         池子空了。
 
-    别的失败照原样抛出。403 11140（账号被上游风控限制）尤其不能跨出口重打：
+    别的失败照原样抛出。403 11140（账号被上游封禁）尤其不能跨出口重打：
     项目对它有一条红线（见 RESTRICTED_403_ROTATE_MAX 附近），换出口继续打同一台
     设备正是它要防的那件事。pinned / 参数错误更不是换出口能修的。
 
@@ -18419,13 +18727,13 @@ def probe_account(account, model=None, timeout=30):
         # cover a gateway that names the credential as bad).
         row["error"] = wb_accounts.http_error_message(exc, detail, 150)
         if exc.code == 403 and restriction_is_account_level(detail):
-            # 测试也认账号级风控限制：不能用 60 秒的普通冷却把 2 小时覆盖掉，
-            # 更不能用「测试通过」的语义把被限制的账号放回池子（见 #422）。
+            # 测试也认账号级封禁：命中即持久禁用，只有操作者手动启用才解除。
             # 一并记连坐事件：一键测试正好是发现「整池被清扫」的入口。
             account.note_restricted(detail=detail)
             _persist_restriction(account)
             note_account_restriction(account.realm, account.uid)
             row["restricted"] = True
+            row["accountBanned"] = True
             row["fails"] = int(account.fails)
             return row
         account.note_error(wb_accounts.http_error_message(exc, detail, 80),
@@ -21235,9 +21543,18 @@ def _anthropic_messages_enabled():
 # ---------------------------------------------------------------------------
 _key_active_concurrency = {}
 _key_concurrency_lock = threading.Lock()
+# 补丁：per-key 并发排队用的信号量。上游只在超限时直接拒绝，客户端会瞬间拿到
+# 429；这里改成有界等待，和用户批准的行为对齐（WB_CHAT_SLOT_WAIT 秒后仍未
+# 拿到才拒绝）。字典按 key id 懒创建，信号量初值在首次拿到 limit 时绑定。
+_key_semaphores = {}
+_key_semaphore_lock = threading.Lock()
 
 def _acquire_key_slot(key_entry):
-    """Try to acquire a concurrency slot for key_entry. Returns (ok, current, limit)."""
+    """Try to acquire a concurrency slot for key_entry. Returns (ok, current, limit).
+
+    补丁：并发占满时不再立即返回 False（客户端会瞬间吃到 429），改用有界信号量
+    排队，最多等 CHAT_SLOT_WAIT_SECONDS 秒。limit 变化时按新值重建信号量。
+    """
     if not isinstance(key_entry, dict):
         return True, 0, 0
     k_id = key_entry.get("id")
@@ -21248,13 +21565,36 @@ def _acquire_key_slot(key_entry):
         return True, 0, 0
     with _key_concurrency_lock:
         current = _key_active_concurrency.get(k_id, 0)
-        if current >= limit:
-            return False, current, limit
-        _key_active_concurrency[k_id] = current + 1
-        return True, current + 1, limit
+    with _key_semaphore_lock:
+        entry = _key_semaphores.get(k_id)
+        if entry is None or entry[0] != limit:
+            if entry is not None:
+                # limit 被改小：按已占用的数量初始化，避免凭空多出配额
+                sem = threading.BoundedSemaphore(max(1, limit))
+                for _ in range(min(current, limit)):
+                    try:
+                        sem.acquire(blocking=False)
+                    except Exception:
+                        pass
+            else:
+                sem = threading.BoundedSemaphore(max(1, limit))
+                for _ in range(current):
+                    try:
+                        sem.acquire(blocking=False)
+                    except Exception:
+                        pass
+            entry = [limit, sem]
+            _key_semaphores[k_id] = entry
+        sem = entry[1]
+    acquired = sem.acquire(timeout=CHAT_SLOT_WAIT_SECONDS)
+    with _key_concurrency_lock:
+        if acquired:
+            _key_active_concurrency[k_id] = _key_active_concurrency.get(k_id, 0) + 1
+            return True, _key_active_concurrency[k_id], limit
+        return False, _key_active_concurrency.get(k_id, 0), limit
 
 def _release_key_slot(key_entry):
-    """Release a concurrency slot for key_entry."""
+    """Release a concurrency slot for key_entry.（补丁：同时归还信号量）"""
     if not isinstance(key_entry, dict):
         return
     k_id = key_entry.get("id")
@@ -21269,6 +21609,15 @@ def _release_key_slot(key_entry):
             _key_active_concurrency[k_id] = current - 1
         else:
             _key_active_concurrency.pop(k_id, None)
+    with _key_semaphore_lock:
+        entry = _key_semaphores.get(k_id)
+        sem = entry[1] if entry else None
+    if sem is not None:
+        try:
+            sem.release()
+        except ValueError:
+            # 释放次数超过初值（limit 被调小过），忽略即可，不能让异常打断请求收尾
+            pass
 
 # 面板上「不带参数」的 POST 按钮：按钮会带一个 `{}` body，而路由从不解析它。
 # 这些 body 必须在分发前排空 —— 否则那 2 个字节留在 socket 里，同一条 keep-alive
@@ -21372,7 +21721,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/2.0.9"
+    server_version = "wb-proxy/2.1.1"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -21922,11 +22271,21 @@ class Handler(BaseHTTPRequestHandler):
 
         A key that lists no models stays unrestricted, so this is a no-op
         unless the operator asked for a limit.
+
+        Two names are accepted: the resolved upstream id (what `model` holds by
+        the time this runs) and the name the client actually sent. An operator
+        alias is a client-facing name, and a key restricted to that alias would
+        otherwise be rejected the moment the alias is rewritten to its target —
+        the request would be blocked by the gateway's own convenience feature.
         """
         entry = self.key_entry
         if not entry:
             return ""
         if wb_settings.key_allows_model(entry, model):
+            return ""
+        original = str(getattr(self, "_client_model", "") or "").strip()
+        if original and original != model \
+                and wb_settings.key_allows_model(entry, original):
             return ""
         return key_model_message(entry, model)
 
@@ -22225,7 +22584,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/settings/reveal":
             return self._get_settings_reveal(query)
         if path == "/agents":
-            return self._get_agents()
+            # ?realm=intl|cn：看板把当前视图（以及所选 Key 绑定的出口）带上来，
+            # 后端据此挑该出口的目录；不带就退回 Key 绑定、再退回全局出口
+            # （见 _agents_realm）。
+            return self._get_agents({"realm": (query.get("realm") or [""])[0]})
         if path == "/agents/model-selection":
             return self._get_agents_model_selection()
         if path == "/agents/available":
@@ -22390,6 +22752,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         data = [model_entry(mid, meta, req_realm) for mid, meta in entries]
+        try:
+            # 别名开关关着时 effective_model_aliases() 返回空表：别名既不进
+            # 清单也不改写请求，原模型名照旧可用。
+            aliases = wb_settings.effective_model_aliases(ACCOUNTS_DIR)
+        except Exception:
+            aliases = {}
         pinned = pinned_account()
         if pinned is not None:
             # 定址路由宣告的是「这个账号实际能接的模型」：该账号禁用的模型
@@ -22399,8 +22767,18 @@ class Handler(BaseHTTPRequestHandler):
         # 目录语义；打开后，配了模型限制的 Key 不会再看到会被本地 400 拒掉
         # 的项，自动发现型客户端也就不会选到必失败的模型。
         if wb_settings.filter_models_by_key(ACCOUNTS_DIR) and self.key_entry:
+            # An alias is a client-facing name, so a key restricted to that
+            # alias must keep the alias's target in the list: the alias entry
+            # appended below is a copy of it. Dropping the target here would
+            # make the alias disappear too, and the client would be told it
+            # has no model although calling the alias works.
+            allowed_targets = {
+                target for alias, target in aliases.items()
+                if wb_settings.key_allows_model(self.key_entry, alias)
+            }
             data = [m for m in data
-                    if wb_settings.key_allows_model(self.key_entry, m.get("id"))]
+                    if wb_settings.key_allows_model(self.key_entry, m.get("id"))
+                    or m.get("id") in allowed_targets]
         # 可选：清单只宣告当前账号池里至少有一个账号能服务的模型。默认关闭
         # 保持全量目录；PRO ONLY 模型只有在池里有付费账号时才列出。
         if wb_settings.models_only_available(ACCOUNTS_DIR):
@@ -22421,6 +22799,10 @@ class Handler(BaseHTTPRequestHandler):
                     "required": "standard",
                     "at": gate_at,
                 }
+        # Operator aliases are advertised next to their target (see
+        # alias_model_entries): clients that discover the catalogue must be
+        # able to see the name they are expected to send.
+        data = alias_model_entries(data, aliases)
         payload = {"object": "list", "data": data,
                    "realm": req_realm or CURRENT_REALM}
         # 来源说明（面板展示用）：这批清单是上游 API 实时取的，还是读的
@@ -22597,7 +22979,7 @@ class Handler(BaseHTTPRequestHandler):
         # accessToken/refreshToken 等凭证字段不受影响。
         doc = _redact_account_names(doc)
         if (query.get("download") or ["0"])[0] in ("1", "true", "yes"):
-            stamp = time.strftime("%Y%m%d-%H%M%S")
+            stamp = wb_time.strftime("%Y%m%d-%H%M%S")
             if len(uids) == 1:
                 # Name a single-account export after the account, so a
                 # folder of them stays readable.
@@ -22695,8 +23077,8 @@ class Handler(BaseHTTPRequestHandler):
             save_task_progress()
         acct_list = []
         for a in cn_accounts:
-            entry = task_progress_entry(a.uid)
             checkin = checkin_today_of(a)
+            entry = task_progress_entry(a.uid)
             acct_list.append({
                 "uid": a.uid,
                 "nickname": a.nickname or a.uid[:8],
@@ -22881,7 +23263,7 @@ class Handler(BaseHTTPRequestHandler):
         lines = [f"[{item['ts']}] [{item['level']}] [{item['tag']}] {_mask_text(str(item['msg']))}"
                  for item in log_data["logs"]]
         text_content = "\n".join(lines).encode("utf-8")
-        filename = f"wb-proxy-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        filename = f"wb-proxy-{wb_time.strftime('%Y%m%d-%H%M%S')}.log"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
@@ -23900,7 +24282,17 @@ class Handler(BaseHTTPRequestHandler):
                     concurrency_limit = item.get("concurrency_limit")
                 else:
                     concurrency_limit = stored.get("concurrency_limit")
-                created_at = item.get("created_at") or (stored.get("created_at") if entry_id in existing else None) or time.strftime("%Y/%m/%d %H:%M")
+                # 日 token 限量（单位 M）。同一规则：请求体没带就沿用已存值，
+                # 否则老面板一保存就把用户的日限量清成 0（#592 同款坑）。
+                if "daily_token_limit" in item:
+                    daily_token_limit = item.get("daily_token_limit")
+                else:
+                    daily_token_limit = stored.get("daily_token_limit")
+                try:
+                    daily_token_limit = max(0, int(daily_token_limit or 0))
+                except (TypeError, ValueError):
+                    daily_token_limit = 0
+                created_at = item.get("created_at") or (stored.get("created_at") if entry_id in existing else None) or wb_time.strftime("%Y/%m/%d %H:%M")
                 cleaned.append({
                     "id": entry_id,
                     "name": name,
@@ -23909,6 +24301,7 @@ class Handler(BaseHTTPRequestHandler):
                     "models": models,
                     "accounts": accounts,
                     "concurrency_limit": concurrency_limit,
+                    "daily_token_limit": daily_token_limit,
                     "enabled": enabled,
                     "created_at": created_at,
                 })
@@ -24119,6 +24512,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, "enable_anthropic_messages must be true or false", "invalid_request_error")
             wb_settings.set_enable_anthropic_messages(ACCOUNTS_DIR, raw)
             reply["enable_anthropic_messages"] = raw
+        if "model_aliases" in payload:
+            try:
+                cleaned = wb_settings.set_model_aliases(
+                    ACCOUNTS_DIR, payload.get("model_aliases"))
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            reply["model_aliases"] = cleaned
+        if "model_aliases_enabled" in payload:
+            raw = payload.get("model_aliases_enabled")
+            if not isinstance(raw, bool):
+                return self._error(400, "model_aliases_enabled must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_model_aliases_enabled(ACCOUNTS_DIR, raw)
+            reply["model_aliases_enabled"] = raw
         if "filter_models_by_key" in payload:
             raw = payload.get("filter_models_by_key")
             if not isinstance(raw, bool):
@@ -24275,6 +24682,14 @@ class Handler(BaseHTTPRequestHandler):
                     "invalid_request_error")
             reply["daily_chat_models"] = \
                 wb_settings.set_daily_chat_models(ACCOUNTS_DIR, raw)
+        if "daily_chat_prefer_flash" in payload:
+            raw = payload.get("daily_chat_prefer_flash")
+            if not isinstance(raw, bool):
+                return self._error(
+                    400, "daily_chat_prefer_flash must be true or false",
+                    "invalid_request_error")
+            wb_settings.set_daily_chat_prefer_flash(ACCOUNTS_DIR, raw)
+            reply["daily_chat_prefer_flash"] = raw
         if "daily_chat_budget" in payload:
             # Whole seconds, 0 = no budget. This is the only time bound of the
             # whole web activity, so wb_settings owns the range check and the
@@ -24403,6 +24818,17 @@ class Handler(BaseHTTPRequestHandler):
                     log_db_touched = True
             if log_db_touched:
                 apply_log_db_settings()
+        if "stats_tz_beijing" in payload:
+            # 统计时区（默认关）：关着的时候全部按宿主时区，与上游一字不差；
+            # 开启后所有对外可见时间与日 / 小时分桶改用固定 +08:00。保存后立即
+            # 生效，并清掉按日键缓存的表。
+            raw = payload.get("stats_tz_beijing")
+            if not isinstance(raw, bool):
+                return self._error(400, "stats_tz_beijing must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_stats_tz_beijing(ACCOUNTS_DIR, raw)
+            reply["stats_tz_beijing"] = raw
+            configure_timezone(raw)
         if "accounts_collapsed" in payload:
             # A disclosure state, and the only thing this branch may touch: the
             # submission carries just this key, so the settings it does not name
@@ -24464,7 +24890,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, "update_check_proxy_slot must be a string",
                                    "invalid_request_error")
             slot_id = raw.strip()
-            if slot_id and not wb_settings.find_proxy_slot(ACCOUNTS_DIR, slot_id):
+            if (slot_id
+                    and slot_id != wb_settings.UPDATE_CHECK_PROXY_SYSTEM
+                    and not wb_settings.find_proxy_slot(ACCOUNTS_DIR, slot_id)):
                 return self._error(400, "update_check_proxy_slot does not exist",
                                    "invalid_request_error")
             reply["update_check_proxy_slot"] = (
@@ -24820,18 +25248,53 @@ class Handler(BaseHTTPRequestHandler):
             host = "127.0.0.1"
         return "http://%s:%d/v1" % (host, int(port or 0))
 
-    def _agents_models(self):
+    def _agents_realm(self, payload=None):
+        """Which exit the one-click config should read its model list from.
+
+        Most specific first, then progressively broader:
+
+          1. an explicit `realm` in the payload - the panel sends its current
+             view (VIEW_REALM) and, when an API key is picked, that key's own
+             binding;
+          2. the exit bound to the key this request authenticated with;
+          3. the global switch, CURRENT_REALM.
+
+        Rule 3 alone is not enough, and that is the whole point of this
+        helper: switching the panel view or binding a key to `intl` only ever
+        affected inference requests (`_request_realm`). `/agents` never
+        consulted either, so a picker opened with an `intl` key still listed
+        the domestic catalogue and no international model could be selected.
+        """
+        if isinstance(payload, dict):
+            explicit = str(payload.get("realm") or "").strip().lower()
+            if explicit in ("intl", "cn"):
+                return explicit
+        try:
+            bound = self._key_realm()
+        except Exception:
+            bound = ""
+        if bound in ("intl", "cn"):
+            return bound
+        return CURRENT_REALM if CURRENT_REALM in ("intl", "cn") else "intl"
+
+    def _agents_models(self, realm=None):
         """Flat model list for the picker; bundled intl+cn catalog, deduped.
 
         Live sources stay out of this path on purpose: the panel must answer
         even when the upstream is down, so a failure here is simply a shorter
         list, never an error.
+
+        `realm` must be threaded through: without it fetch_models() falls back
+        to the global CURRENT_REALM, so the picker would list one exit's
+        catalogue no matter which exit the operator is configuring for. The
+        "intl+cn" in the line above only holds for the bundled fallback
+        below, which is what runs when the live catalogue is unavailable.
         """
         models = []
         seen = set()
         try:
             try:
-                entries = fetch_models()
+                entries = fetch_models(realm=realm)
             except Exception:
                 entries = []
             if entries:
@@ -24927,7 +25390,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         return
 
-    def _get_agents(self):
+    def _get_agents(self, payload=None):
         if not self._agents_client_allowed():
             # 远程看板（服务端 / Docker / OpenWrt）：一键配置改的是网关所在
             # 机器的配置目录，到不了用户自己的电脑，直接按不可用返回。
@@ -24944,14 +25407,22 @@ class Handler(BaseHTTPRequestHandler):
                         "id": entry.get("id"),
                         "name": entry.get("name") or "",
                         "enabled": True,
+                        # 出口绑定：面板据此提示「这个 Key 固定走哪个版本」。
+                        # 没有它，看板就无法判断写进去的模型客户端调不调得动
+                        # ——绑了出口的 Key 换版本会直接 400（_cross_realm_error）。
+                        "realm": entry.get("realm") or "",
                     })
         except Exception:
             keys = []
         selection = wb_settings.agent_model_selection(ACCOUNTS_DIR)
+        realm = self._agents_realm(payload)
         return self._json(200, {
             "enabled": True,
+            # 这份目录属于哪个出口：面板据此在标题旁标注，避免「以为在配
+            # 国际版、实际拿到国内版清单」这种看不见的错位。
+            "realm": realm,
             "clients": list(wb_agents.overview(ACCOUNTS_DIR).values()),
-            "models": self._agents_models(),
+            "models": self._agents_models(realm),
             # 「网关模型清单」里勾选的模型：一键配置只把这些写进客户端。
             # None（从未保存）时给空列表，由 models_configured 区分「没选过」
             # 与「选了 0 个」——前者 apply 退回完整目录，后者 apply 拒绝。
@@ -25011,13 +25482,18 @@ class Handler(BaseHTTPRequestHandler):
                 400, "base_url must start with http:// or https://",
                 "invalid_request_error")
         model = str(payload.get("model") or "").strip() or None
+        # 补模型规格（上下文窗口 / 输出上限 / 思考档位）必须和下拉框用同一个
+        # 出口的目录：否则国际版模型在这里查不到规格，写进客户端的清单里只剩
+        # 一个 id，DSH / Crush 这类客户端拿不到档位控件。
+        realm = self._agents_realm(payload)
         models = payload.get("models")
         if models is None:
             # 前端没带清单（老看板 / 直接调接口）：优先用「网关模型清单」里
-            # 勾选的模型；从未保存过勾选（升级前的老安装）才退回完整目录。
+            # 勾选的模型；从未保存过勾选（升级前的老安装）才退回该出口的
+            # 完整目录。
             selection = wb_settings.agent_model_selection(ACCOUNTS_DIR)
             if selection is None:
-                models = self._agents_models()
+                models = self._agents_models(realm)
             else:
                 models = [{"id": mid} for mid in selection]
         if not isinstance(models, list):
@@ -25037,7 +25513,7 @@ class Handler(BaseHTTPRequestHandler):
         # 写出来的模型列表只有 id，客户端就只能吃自己的内置默认值。
         try:
             specs = {}
-            for spec in self._agents_models():
+            for spec in self._agents_models(realm):
                 if isinstance(spec, dict) and spec.get("id"):
                     specs[str(spec["id"])] = spec
         except Exception:
@@ -25343,6 +25819,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_account_credits_detail(payload)
         if path == "/tasks/run":
             return self._route_tasks_run(payload)
+        if path == "/tasks/night":
+            return self._route_tasks_night(payload)
         if path == "/tasks/claim":
             return self._route_tasks_claim(payload)
         if path == "/tasks/travel":
@@ -25395,14 +25873,21 @@ class Handler(BaseHTTPRequestHandler):
         """
         target = str(payload.get("product") or "").strip().lower()
         uid = payload.get("uid")
+        uids = payload.get("uids")
         realm = payload.get("realm")
 
         if target not in wb_identity.VALID_PRODUCTS:
             return self._error(400, "product must be 'workbuddy', 'vscode', or 'cli'",
                                "invalid_request_error")
+        if "uids" in payload and not isinstance(uids, list):
+            return self._error(400, "uids must be a list", "invalid_request_error")
 
         if uid:
             targets = [POOL.get(uid)]
+        elif isinstance(uids, list):
+            # 面板的「切换所有出站身份」在有勾选时只切勾选的号，没有勾选时按当前
+            # 筛选结果点名（空列表 = 什么都不切，不退化成全池）。
+            targets = [POOL.get(u) for u in dict.fromkeys(str(x) for x in uids if x)]
         elif realm and realm != "all":
             targets = [a for a in POOL.accounts if a.realm == realm]
         else:
@@ -25540,6 +26025,64 @@ class Handler(BaseHTTPRequestHandler):
             "credit_added": total_credit,
             "logs": combined_logs,
             "accounts_count": len(targets)
+        })
+
+    def _route_tasks_night(self, payload):
+        """Run the daily night-owl task only.
+
+        Kept separate from /tasks/run: that endpoint is the one-time / event
+        task pipeline, while black_cat is a daily task with its own 23:00-08:00
+        window. Mixing them made a one-time run consume a daily quota silently.
+        """
+        if not POOL:
+            return self._json_panel(200, {"ok": False, "msg": "账号池不可用"})
+        invalidate_tasks_cache()
+        uid = payload.get("uid")
+        if uid and uid != "all":
+            target = POOL.get(uid)
+            if not target or target.realm != "cn":
+                return self._json_panel(200, {"ok": False,
+                                              "msg": "未找到指定的国内版账号"})
+            targets = [target]
+        else:
+            targets = POOL.task_accounts("cn")
+        targets = [a for a in targets if a is not None]
+        if not targets:
+            return self._json_panel(200, {"ok": False,
+                                          "msg": "未找到参与任务的国内版账号"})
+
+        from wb_tasks import run_night_growth
+        results = []
+        all_ok = True
+        for i, acc in enumerate(targets):
+            uid_str = acc.uid[:8] if acc.uid else "?"
+            nick = acc.nickname or uid_str
+            res = run_night_growth(acc)
+            ok = res.get("ok") is not False
+            all_ok = all_ok and ok
+            results.append({
+                "uid": acc.uid,
+                "nickname": nick,
+                "ok": ok,
+                "logs": res.get("logs") or [],
+                "earned_credit": res.get("earned_credit") or 0,
+            })
+            for line in res.get("logs") or []:
+                add_log_entry(f"[任务福利] 账号 [{nick}] 夜猫子任务: {line}",
+                              tag="tasks")
+            if i < len(targets) - 1:
+                time.sleep(1.0)
+
+        summary = chr(10).join(
+            "%s: %s" % (r["nickname"],
+                        (r["logs"][-1] if r["logs"] else
+                         ("完成" if r["ok"] else "未完成")))
+            for r in results)
+        return self._json_panel(200, {
+            "ok": all_ok,
+            "results": results,
+            "msg": summary,
+            "accounts_count": len(targets),
         })
 
     def _route_tasks_claim(self, payload):
@@ -25996,7 +26539,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _route_accounts_refresh(self, payload):
         uid = payload.get("uid")
-        targets = [POOL.get(uid)] if uid else list(POOL.accounts)
+        uids = payload.get("uids")
+        if "uids" in payload and not isinstance(uids, list):
+            return self._error(400, "uids must be a list", "invalid_request_error")
+        if uid:
+            targets = [POOL.get(uid)]
+        elif isinstance(uids, list):
+            # 面板的批量刷新会把「勾选的账号」或「当前筛选结果」的 uid 直接点名，
+            # 空列表就是什么都不刷，不退化成全池。
+            targets = [POOL.get(u) for u in dict.fromkeys(str(x) for x in uids if x)]
+        else:
+            targets = list(POOL.accounts)
         group = str(payload.get("group") or "").strip()
         if group:
             targets = [a for a in targets if a is not None and a.group == group]
@@ -26088,8 +26641,18 @@ class Handler(BaseHTTPRequestHandler):
         if realm not in ("intl", "cn"):
             realm = CURRENT_REALM
         model = payload.get("model") or TEST_MODEL_DEFAULT
-        targets = [a for a in (POOL.accounts if POOL else [])
-                   if a.realm == realm and a.enabled]
+        uids = payload.get("uids")
+        if "uids" in payload and not isinstance(uids, list):
+            return self._error(400, "uids must be a list", "invalid_request_error")
+        if isinstance(uids, list):
+            # 面板的「测试」在有勾选时只测勾选的号、没有勾选时按当前筛选结果点名。
+            # 点名的账号不受 realm / enabled 过滤：勾选本身就是明确的选择，停用的
+            # 号也要能被测一次（测通会顺手清掉熔断计数）。空列表 = 什么都不测。
+            targets = [POOL.get(u) for u in dict.fromkeys(str(x) for x in uids if x)]
+            targets = [a for a in targets if a is not None]
+        else:
+            targets = [a for a in (POOL.accounts if POOL else [])
+                       if a.realm == realm and a.enabled]
         texts, _ = _ensure_pools()
         targets = [a for a in targets
                    if texts is None or texts.allows(a)]
@@ -26221,6 +26784,39 @@ class Handler(BaseHTTPRequestHandler):
             return self._json_panel(200, {
                 "moved": len(moved),
                 "uids": moved,
+                "accounts": account_views(),
+            })
+        uids = payload.get("uids")
+        if uids is not None:
+            # Checkbox batch actions are an explicit set, not a group or the
+            # whole pool. Reject malformed or unknown UIDs instead of silently
+            # applying the operation to something broader.
+            if not isinstance(uids, list) or not uids:
+                return self._error(
+                    400, "uids must be a non-empty list",
+                    "invalid_request_error")
+            wanted = list(dict.fromkeys(
+                str(uid).strip() for uid in uids if str(uid).strip()))
+            if not wanted:
+                return self._error(
+                    400, "uids must contain at least one non-empty uid",
+                    "invalid_request_error")
+            missing = [uid for uid in wanted if POOL.get(uid) is None]
+            if missing:
+                return self._error(
+                    404, "no such account: %s" % ", ".join(missing[:5]),
+                    "invalid_request_error")
+            raw_enabled = payload.get("enabled")
+            if not isinstance(raw_enabled, bool):
+                return self._error(400, "enabled must be true or false",
+                                   "invalid_request_error")
+            changed = POOL.set_enabled_many(wanted, raw_enabled)
+            log("selected accounts: %d %s"
+                % (len(changed),
+                   "enabled" if raw_enabled else "disabled"))
+            return self._json_panel(200, {
+                "changed": len(changed),
+                "uids": changed,
                 "accounts": account_views(),
             })
         group = str(payload.get("group") or "").strip()
@@ -26771,6 +27367,14 @@ class Handler(BaseHTTPRequestHandler):
         model = chat_req.get("model") or "unknown"
         want_stream = bool(chat_req.get("stream"))
         session_key = extract_session_key(self.headers, chat_req)
+        if not session_key:
+            # 单发调用（stream=false、msgs<=3）：亲和键不含易变的首条 user 文本，
+            # 否则每次都是「新会话」，被 affinity_route 轮询换号，而上游 prompt
+            # cache 是按账号存的 —— 换一个号就整段重付一次。
+            session_key = msgstat_affinity_key(self._key_id(), chat_req)
+            if not session_key:
+                # 真会话（流式 / 已续轮）仍走前缀亲和，顺手把第 2 轮绑定过继。
+                prebind_prefix_second_turn(chat_req)
         t_start = time.time()
         fp = prompt_fingerprint(chat_req.get("messages"))
         try:
@@ -27160,11 +27764,47 @@ class Handler(BaseHTTPRequestHandler):
         if is_media_route:
             return self._handle_media_post(path, payload)
         try:
-            aliases = wb_settings.model_aliases(ACCOUNTS_DIR)
+            aliases = wb_settings.effective_model_aliases(ACCOUNTS_DIR)
         except Exception:
             aliases = {}
+        # The key's model restriction is expressed in the names the client
+        # sends, and an operator alias is exactly such a name. Remember it
+        # before the rewrite so `_key_model_error` can accept either spelling
+        # (see its docstring).
+        try:
+            self._client_model = str(payload.get("model") or "")
+        except Exception:
+            self._client_model = ""
         _apply_model_aliases(payload, aliases)
         _apply_background_model_alias(payload)
+        # 日 token 限量（单位 M，0/缺省 = 不限）。放在并发槽位之前判断：
+        # 已经被限的 key 不该先排队等 WB_CHAT_SLOT_WAIT 秒再被拒。
+        # 用量来自 _daily_usage 的 keytokens 视图（默认 15s 缓存）。
+        _daily_limit_m = 0
+        try:
+            _daily_limit_m = int((self.key_entry or {}).get("daily_token_limit") or 0)
+        except (TypeError, ValueError):
+            _daily_limit_m = 0
+        if _daily_limit_m > 0:
+            _quota_hit = False
+            try:
+                _stats = daily_usage_stats()
+                if _stats is not None:
+                    _used = int((_stats.get("keytokens") or {}).get(self._key_id(), 0) or 0)
+                    if _used >= _daily_limit_m * 1000000:
+                        _quota_hit = True
+            except Exception as _qexc:
+                log("daily quota check failed: %s" % (_qexc,))
+            if _quota_hit:
+                key_name = (self.key_entry or {}).get("name") or self._key_id() or "当前 Key"
+                message = ("Daily token quota exhausted for API key '%s' "
+                           "(%d M per day used); it resets at local midnight"
+                           % (key_name, _daily_limit_m))
+                record_error(payload.get("model") or "unknown", 403, message,
+                             stream=payload.get("stream"), key=self._key_id())
+                if is_messages_route:
+                    return self._anthropic_error(403, message, "permission_error")
+                return self._error(403, message, "permission_error")
         # Check per-key concurrency limit (#359)
         key_ok, cur_key_conc, max_key_conc = _acquire_key_slot(self.key_entry)
         if not key_ok:
@@ -27457,6 +28097,9 @@ class Handler(BaseHTTPRequestHandler):
             # A retry reuses the headers already on the wire; the client has not
             # seen a single byte, so a fresh chunk id is safe.
             stream_chunk_id = f"chatcmpl-wb-{uuid.uuid4().hex[:16]}"
+            # Synthesized text/tool frames must carry the same name the client
+            # sent, like the upstream frames rewritten below.
+            echo_model = client_facing_model(self, model)
             emitted = False
             last_usage = None
             first_ms = None
@@ -27501,10 +28144,10 @@ class Handler(BaseHTTPRequestHandler):
                 for action in actions:
                     if action[0] == "text":
                         if action[1]:
-                            write_chunk(chat_text_chunk(model, action[1], chunk_id=stream_chunk_id))
+                            write_chunk(chat_text_chunk(echo_model, action[1], chunk_id=stream_chunk_id))
                     else:
                         synthesized_calls = True
-                        for payload in chat_tool_call_chunks(model, action[1], chunk_id=stream_chunk_id):
+                        for payload in chat_tool_call_chunks(echo_model, action[1], chunk_id=stream_chunk_id):
                             write_chunk(payload)
 
             def before_read():
@@ -27570,7 +28213,7 @@ class Handler(BaseHTTPRequestHandler):
                         # client asked for the logical id, and model-scoped
                         # chunk helpers below must use that same id too.
                         if isinstance(maybe, dict) and maybe.get("model"):
-                            maybe["model"] = model
+                            maybe["model"] = client_facing_model(self, model)
                         cleaned = clean_chunk(
                             json.dumps(maybe, ensure_ascii=False)
                             if isinstance(maybe, dict) else data)
@@ -27704,6 +28347,9 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         if egress_on and egress_key:
             wb_egress.note_success(egress_key)
+        if isinstance(result, dict):
+            result["model"] = client_facing_model(
+                self, result.get("model") or model)
         wall = int((time.time() - t_start) * 1000)
         first_at = result.get("first_chunk_at")
         # Measured from request arrival so streaming and non-streaming are comparable.
@@ -27720,9 +28366,18 @@ class Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 _key_active_concurrency = {}
 _key_concurrency_lock = threading.Lock()
+# 补丁：per-key 并发排队用的信号量。上游只在超限时直接拒绝，客户端会瞬间拿到
+# 429；这里改成有界等待，和用户批准的行为对齐（WB_CHAT_SLOT_WAIT 秒后仍未
+# 拿到才拒绝）。字典按 key id 懒创建，信号量初值在首次拿到 limit 时绑定。
+_key_semaphores = {}
+_key_semaphore_lock = threading.Lock()
 
 def _acquire_key_slot(key_entry):
-    """Try to acquire a concurrency slot for key_entry. Returns (ok, current, limit)."""
+    """Try to acquire a concurrency slot for key_entry. Returns (ok, current, limit).
+
+    补丁：并发占满时不再立即返回 False（客户端会瞬间吃到 429），改用有界信号量
+    排队，最多等 CHAT_SLOT_WAIT_SECONDS 秒。limit 变化时按新值重建信号量。
+    """
     if not isinstance(key_entry, dict):
         return True, 0, 0
     k_id = key_entry.get("id")
@@ -27733,13 +28388,36 @@ def _acquire_key_slot(key_entry):
         return True, 0, 0
     with _key_concurrency_lock:
         current = _key_active_concurrency.get(k_id, 0)
-        if current >= limit:
-            return False, current, limit
-        _key_active_concurrency[k_id] = current + 1
-        return True, current + 1, limit
+    with _key_semaphore_lock:
+        entry = _key_semaphores.get(k_id)
+        if entry is None or entry[0] != limit:
+            if entry is not None:
+                # limit 被改小：按已占用的数量初始化，避免凭空多出配额
+                sem = threading.BoundedSemaphore(max(1, limit))
+                for _ in range(min(current, limit)):
+                    try:
+                        sem.acquire(blocking=False)
+                    except Exception:
+                        pass
+            else:
+                sem = threading.BoundedSemaphore(max(1, limit))
+                for _ in range(current):
+                    try:
+                        sem.acquire(blocking=False)
+                    except Exception:
+                        pass
+            entry = [limit, sem]
+            _key_semaphores[k_id] = entry
+        sem = entry[1]
+    acquired = sem.acquire(timeout=CHAT_SLOT_WAIT_SECONDS)
+    with _key_concurrency_lock:
+        if acquired:
+            _key_active_concurrency[k_id] = _key_active_concurrency.get(k_id, 0) + 1
+            return True, _key_active_concurrency[k_id], limit
+        return False, _key_active_concurrency.get(k_id, 0), limit
 
 def _release_key_slot(key_entry):
-    """Release a concurrency slot for key_entry."""
+    """Release a concurrency slot for key_entry.（补丁：同时归还信号量）"""
     if not isinstance(key_entry, dict):
         return
     k_id = key_entry.get("id")
@@ -27754,6 +28432,15 @@ def _release_key_slot(key_entry):
             _key_active_concurrency[k_id] = current - 1
         else:
             _key_active_concurrency.pop(k_id, None)
+    with _key_semaphore_lock:
+        entry = _key_semaphores.get(k_id)
+        sem = entry[1] if entry else None
+    if sem is not None:
+        try:
+            sem.release()
+        except ValueError:
+            # 释放次数超过初值（limit 被调小过），忽略即可，不能让异常打断请求收尾
+            pass
 
 
 
@@ -27969,6 +28656,10 @@ def _bootstrap_runtime(args):
     # 不建文件、不改日志路径。
     LOG_STORE = wb_logstore.LogStore(os.path.join(USAGE_DIR, "logs.sqlite3"))
     apply_log_db_settings()
+    # 统计时区（默认关闭）：在账号池与任何一行日志之前定下来，免得启动头几
+    # 条日志与后续行落在两个时区里。关着的时候 wb_time 全是直通，行为与上游
+    # 完全一致。
+    configure_timezone()
     # LAN mode must not ship a known key: the gateway spends the account's own
     # upstream quota, so a guessable default lets anyone on the network drain
     # it. Generate one on first use, persist it, and reuse it afterwards.
