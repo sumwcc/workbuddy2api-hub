@@ -20,7 +20,7 @@
 This project is for protocol research and personal use only. Prefer the official client, do not use your primary account, and do not resell or share access.
 
 <p align="center">
-  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v2.2.0-2496ED?style=flat-square" alt="Version 2.2.0"></a>
+  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v2.1.3-2496ED?style=flat-square" alt="Version 2.1.3"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -33,7 +33,7 @@ This project is for protocol research and personal use only. Prefer the official
 - **标准 API 兼容**：将 WorkBuddy（国际版/国内版）与 CodeArts 封装为标准 OpenAI 格式（Chat Completions / Responses），无缝支持 Codex、Claude Code、NextChat 等各类客户端。
 - **开箱即用与多端部署**：便携版免装环境（Windows 自带精简运行时），支持 Docker、NAS（群晖/飞牛）一键部署及 OpenWrt 路由器固件。
 - **多账号池与出口隔离**：支持浏览器 OAuth 快速导入、每账号独立出口代理槽绑定、设备指纹隔离、自动故障转移与配额轮转。
-- **自动化福利与签到**：内置国内版全套成长任务、加油站签到与猫猫旅行，支持国际版每日活跃会话与 CodeArts 自动签到。
+- **自动化福利与签到**：内置国内版成长任务、星巴克 / 记者节运营活动、小程序任务、加油站签到与猫猫旅行，支持国际版每日活跃会话与 CodeArts 自动签到；手机 App 对话、公众号关注与公益捐赠等必须真实完成的任务只提示、不伪造。
 - **可视化管理看板**：提供 Web 仪表盘，支持实时请求日志、Token/积分透视、多 API Key 权限分发（模型/账号白名单）与额度护栏。
 - **一键工作台启动**：`start-workbuddy-all.bat` 先用 `--probe-only` 检查端口上的实例是否健康，未运行才拉起网关并打开 WorkBuddy 工作台，避免重复启动或误连陌生服务。
 
@@ -283,8 +283,9 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 305 个套件：229 个 Python + 76 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 306 个套件：229 个 Python + 77 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
+- `tests/_visual_recent.py` 是同一类手动检查器：用合成 fixture 起一份 1480 宽的「请求列表」，验证失败徽章点开的详情弹窗、四个过滤下拉真的把参数发到 `/usage/recent`，并把列表 / 弹窗 / 筛选条截图写到系统临时目录的 `wb-visual-recent/`。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
 ---
@@ -292,13 +293,15 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 ## 七、版本更新记录 (Changelog)
 
 本版更新与完整历史版本请查阅 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
-### Unreleased
+### v2.1.3
 
-- **CodeArts 请求积分不再恒为 0**（#866）：CodeArts 聊天 SSE 只返回 token，不返回逐请求 `credit`。网关现在在请求发出前读取账号累计已用积分，响应结束后按差值写入本次 usage 行；`chat/completions`、`responses`、`messages` 的流式与非流式共用同一结算点。采样失败、计数回退或上游已返回非零 `credit` 时不改写，且查询失败不会影响正常聊天。
+- **运营活动与成长任务补全**：新增星巴克协作、记者节福利活动，接入任务读取、`viewed`、事件上报、`claim` 与 `claimed_at` 回读；技能分享改为创建真实分享渠道并确认进度后领奖；模板任务按服务端场景逐组上报四事件。手机 App 对话任务只提示、不伪造。
+- **CodeArts 并发占满改为有界排队**（#886 / #887）：单账号并发槽被占满时最多等待 `busy_wait_seconds`（默认 10 秒），名额释放立即唤醒；超时返回可重试的 429，不再误报 502「没有可用的账号」。真正空池 / 全停用 / 全冷却仍提示添加账号。
+- **工具 Schema 关键字类型纠偏**（#885）：数字、布尔、字符串约束字段统一纠偏，并拒绝 `NaN / Infinity`，修复上游 code 11129。
+- **清理合并遗留的重复顶层定义**（#888），避免后续维护误改到不生效的旧定义。
 - **统计时区开关（北京时间）**：设置 →「日志与系统」新增「统计时区」卡片（`settings.json` 键 `stats_tz_beijing`，`/settings/save` 只收 JSON 布尔，默认关闭）。关闭时全部时间按服务器所在时区显示与分桶，与上游一致；勾选后统一按北京时间（固定 UTC+8）计算日志时间戳、请求记录、撞线 / 重置时刻、今日活动、用量日 / 小时分桶、签到日期、额度重置日与导出文件名。落盘仍存 epoch，切换只影响展示与日历日计算，保存后立即生效。实现用固定偏移而不是 `TZ=Asia/Shanghai` + `tzset()`：中国自 1991 年起无夏令时，固定偏移不需要 tzdata，Windows 没有 `tzset`、musl / OpenWrt 镜像常缺 zoneinfo 也能正确工作。 / A statistics-timezone switch (Settings → Logs & system) now offers Beijing time: `stats_tz_beijing` in `settings.json`, a strict JSON boolean on `/settings/save`, off by default. With it off every time is shown and bucketed in the host timezone exactly as before; switched on, log timestamps, request rows, limit-hit and reset moments, today's activity, usage day/hour buckets, check-in dates, quota reset days and export filenames all use a fixed UTC+8. Epochs are still what gets stored, so the switch only changes display and calendar-day maths, and it takes effect on save. The implementation uses a fixed offset rather than `TZ=Asia/Shanghai` + `tzset()`: China has had no DST since 1991, so no tz database is needed, which keeps it correct on Windows (no `tzset`) and on musl / OpenWrt images that ship without zoneinfo.
 
-### Unreleased
-
+- **请求列表：失败看得进去、筛得出结果**：结果列里的「失败 / 上游中断 / 客户端取消」改成可点按钮，点开是一层详情弹窗——HTTP 状态码、上游原话（落盘时已截断 200 字）、账号、API Key、模型、耗时、模式、token 与请求类型，可一键复制；行上不再为它多占一列。筛选条移到标题下方（表格之上），新增「结果（全部 / 成功 / 失败）/ 账号 / 模型 / Key」四个下拉，全部走服务端 `GET /usage/recent?account=&model=&key=&outcome=`：日志上百万行时不是只筛当前页，而是向后最多扫描 `WB_RECENT_FILTER_SCAN`（默认 20000）行；扫到上限时返回 `total_exact=false` 与 `scanned=N`，界面写明「已扫描 N 行，命中 M 条（可能还有更早的）」，不假装知道全量。「失败」是个桶：`failed` / `upstream_aborted` / `client_aborted` 都算没成功。账号 / 模型 / Key 三个下拉恒带搜索框（`data-cs-search="on"`），几十上百条也不用翻。 / **Request list: failures readable, results filterable**: the outcome cell's "failed / upstream aborted / client aborted" badges are buttons now, opening a detail dialog with the HTTP status, the upstream message as recorded (already truncated to 200 chars), account, API key, model, elapsed time, mode, token counts and request type, copyable in one click - with no extra column spent on the row. The filter bar moves above the table and gains outcome (all / succeeded / failed), account, model and key dropdowns, all served by `GET /usage/recent?account=&model=&key=&outcome=`: with millions of log lines the filter is not limited to the current page - it scans back at most `WB_RECENT_FILTER_SCAN` (default 20000) rows and reports `total_exact=false` plus `scanned=N` when it hits that cap, so the UI says "scanned N rows, M matched (older rows may exist)" instead of pretending to know the total. "Failed" is a bucket: `failed` / `upstream_aborted` / `client_aborted` all count as not-succeeded. The account / model / key dropdowns always carry a search box (`data-cs-search="on"`), so a few hundred entries do not have to be scrolled by hand.
 - **账号页批量操作统一按「勾选否则当前筛选结果」定作用范围**：刷新积分 / 刷新凭证 / 测试 / 分配代理 / 切换所有出站身份 / 启用 / 停用原来各写一套口径（有的刷整池、有的只认分组），现在统一走 `acctScopeUids()`——有勾选只作用于勾选的账号，没有勾选则作用于当前筛选结果的全部账号（视图 + 号池 + 搜索 / 状态 / 分组 / 错误码，且不分页，避免「全部」只作用当前页）。批量挪号池仍要求先勾选：号池归属是一次明确的指派，没有勾选无从下手。`/accounts/refresh`、`/accounts/test`、`/accounts/product` 新增 `uids` 点名，空列表即什么都不做，不退化成全池；`/accounts/set-all` 原本就要求显式 UID 列表。按钮同时去掉「一键」前缀（刷新积分 / 刷新凭证 / 测试 / 分配代理 / 切换所有出站身份 / 启用 / 停用），「当前分组启用 / 停用」保留。 / The account page's bulk actions now share one scope rule: "Refresh credits", "Refresh tokens", "Test", "Assign proxy exits", "Switch all outbound identities", "Enable" and "Disable" each used to compute their own target set (some hit the whole pool, some only the group filter). They now all go through `acctScopeUids()`: the ticked accounts when there are any, otherwise the whole current filter result (view + pool + search / status / group / error code, and not just the current page, so "all" does not silently mean "this page"). Moving accounts between pools still requires a selection, because a pool assignment is an explicit choice. `/accounts/refresh`, `/accounts/test` and `/accounts/product` accept a `uids` list now; an empty list does nothing instead of falling back to the whole pool, and `/accounts/set-all` already required an explicit UID list. The "一键" prefix is dropped from those buttons while "Enable / Disable current group" keeps its name.
 - **号池筛选常显并改为下拉框**：账号表的号池筛选不再跟随「文本 / 媒体号池隔离」开关隐藏——`poolScope` 是账号的归属标记，隔离关着时它只影响服务端派发，不影响这个字段可查可改。三个互斥按钮（全部 / 文本 / 媒体）换成一个下拉框，默认「全部号池」，选中即生效；账号行的号池徽章同样恒显示，「移入媒体池 / 移入文本池」不再要求先开隔离。移动端号池组排成一行（下拉 + 计数 + 两个按钮），不再各占一行把账号列表推下去。 / The pool filter no longer hides behind the pool-separation switch: `poolScope` is an account's ownership tag, and the switch only affects server-side dispatch, not whether the field can be seen or changed. The three mutually exclusive buttons become one dropdown (All / Text / Media, default All, applied immediately); the pool badge on each row is always shown, and "Move to media pool" / "Move to text pool" no longer require the switch. On phones the pool group sits on a single row (dropdown + counter + two buttons) instead of pushing the account list down.
 - **模型别名开关**：`model_aliases` 之前只是一张无条件生效的映射表——填进去的别名立刻对所有客户端可见、所有请求都会被改写，运维想「先填好但暂不生效」没有手段。新增 `model_aliases_enabled`（缺省关闭，旧配置升级后行为不变），关闭时别名既不进 `/v1/models` 也不改写请求，原模型名照常可用；开启后别名与原名都可用，别名在模型清单里紧跟其目标模型列出。面板「设置 → 模型与定价」新增开关，「网关 → 模型清单」新增行内「对外名称」列（开关关闭时整列隐藏），支持直接编辑单个模型的对外名称。配套：别名请求的应答回显客户端发来的名字（`client_facing_model`），配了模型限制的 Key 用别名调用不再被网关自己的改写拦下，`/settings` 与 `/settings/save` 读写 `model_aliases` / `model_aliases_enabled`。 / **Model alias switch**: `model_aliases` used to be an unconditionally applied mapping table - any alias typed in was immediately visible to every client and rewritten on every request, with no way to stage a table without activating it. A new `model_aliases_enabled` key (off by default, so upgrades keep the old behaviour) gates it: while off, aliases are neither listed in `/v1/models` nor rewritten, and the original model names keep working; while on, aliases and original names both work and each alias is listed right next to its target. The panel gains a switch under Settings -> Models & pricing and an inline "External name" column in the gateway model catalog (the whole column hides while the switch is off), editable per model. Supporting changes: replies echo the name the client sent (`client_facing_model`), a key restricted to an alias is no longer rejected by the gateway's own rewrite, and `/settings` plus `/settings/save` read and write `model_aliases` / `model_aliases_enabled`.
